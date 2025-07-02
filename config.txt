@@ -1,0 +1,2 @@
+email yourNCBIemail@address.com
+apikey yourNCBIAPIKeyWithLettersAndNumbers
