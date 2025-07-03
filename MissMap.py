@@ -10,9 +10,9 @@ from urllib.error import HTTPError # handles API request errors
 from xml.etree import ElementTree as ET # looks through XML on NCBI
 
 # decide on using Entrez or OpenAI for synonym recognition - not working in my environment idek whatever
-from langchain_openai import AzureChatOpenAI # 
-from langchain.schema import SystemMessage, HumanMessage #
-from langchain_core.output_parsers import JsonOutputParser #
+# from langchain_openai import AzureChatOpenAI # 
+# from langchain.schema import SystemMessage, HumanMessage #
+# from langchain_core.output_parsers import JsonOutputParser #
 
 
 # SETUP 
@@ -167,13 +167,13 @@ class Configuration:
 
 
 
-# actually asks for species and data inputs and runs missmap
+# asks for species and data inputs and runs missmap
 class MissMap:
 
     # this is probably going to change a lot still - user feedback needed 
     FILTERS = {
         "chloroplast":    "organelle:chloroplast",
-        "mitochondrion":  "mitochondrion[Filter]", # dk why this isn't considered an organelle
+        "mitochondrion":  "mitochondrion[Filter]",
         "nuclear":        "biomol_genomic[PROP] NOT srcdb_refseq[PROP]", # nuclear dna NOT from RefSeq
         "transcriptome":  "biomol_mrna[PROP] NOT srcdb_refseq[PROP]", # mRNA NOT from RefSeq
         "RefSeq":         "srcdb_refseq[PROP]", # anything from RefSeq
@@ -262,8 +262,8 @@ class MissMap:
                 time.sleep(0.12) # api rest
 
             row["Total Count of Data Found"] = str(total_count)  # adds total count of NCBI data counted for the data types provided ONLY
-            # row["synonyms"] = ",".join(self.lookup_synonyms_manually(species)) # comma joined synonym list for the synonym outputs
-            row["synonyms"] = ",".join(self.handle_synonyms_with_AI(species))
+            row["synonyms"] = ",".join(self.lookup_synonyms_manually(species)) # comma joined synonym list for the synonym outputs
+            # row["synonyms"] = ",".join(self.handle_synonyms_with_AI(species))
 
             # only happens if nothing returns- probably indicative of an error or misinput 
             if total_count == 0:
@@ -389,3 +389,6 @@ if __name__ == "__main__":
 # or just replace email & api values in the config file with any invalid input so it doesnt ask 
 
 # need to state that the default request value is being used when this happens
+
+
+# MAJOR PROBLEM - Currently doesn't work without api key i think...
