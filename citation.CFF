@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Mansour"
+  given-names: "Linda"
+  orcid: "https://orcid.org/0009-0000-9262-7246"
+- family-names: "Walker"
+  given-names: "Joseph F."
+  orcid: "https://orcid.org/0000-0003-2928-8899"
+title: "MissMap"
+version: 1.0.0
+doi: 
+date-released: 2025-06-25
+url: "https://github.com/zawmbi/MissMap"
