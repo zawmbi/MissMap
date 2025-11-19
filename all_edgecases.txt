@@ -1,9 +1,5 @@
-import os
-import sys
-import pytest
-from unittest.mock import MagicMock
-
-
+# This is just for copy pasting all different edgecases for testing purposes.
+-----------------------------------------------------------------------------
 # NO EMAIL ONLY
 
 # NO API KEY ONLY
@@ -29,3 +25,4 @@ from unittest.mock import MagicMock
 # WRONG SPECIES SUPPLIED ONLY
 
 # TESTING ALL SYNONYMS FOR SPECIES IN ONE INPUT
+

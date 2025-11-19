@@ -1,0 +1,6 @@
+,Species,chloroplast,mitochondrion,nuclear,transcriptome,RefSeq,WGS,rbcL,matK,ITS,trnL,psbA-trnH,atpF-atpH,psbK-psbI,rpoB,rpoC1,ycf1,ndhF,Total Count of Data Found,synonyms
+0,arabidopsis thaliana,33,193,919393,1610490,53835,6369,48,42,27,37,2,12,0,22,15,15,23,2590556,"Arabis thaliana,thale cress"
+1, oryza sativa,12,315,919662,1321197,55746,22511,467,225,124,31,5,29,10,42,47,1,32,2320456,Asian cultivated rice
+2, zea mays,4,442,2614819,2191644,77385,30105,39,45,80,15,0,30,0,30,30,0,31,4914699,Zea mays var. japonica
+3, solanum lycopersicum,20,46,433276,319067,59892,316,100,55,133,14,6,40,0,41,41,39,40,813126,"Lycopersicon esculentum,Lycopersicon esculentum var. esculentum,Solanum esculentum,Solanum lycopersicum var. humboldtii,tomato"
+4, Solanaceae,57,1099,2976378,1635268,1099456,877290,3286,3642,4731,2100,3197,1334,32,1489,1451,1521,2170,6614501,
