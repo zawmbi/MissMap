@@ -377,6 +377,7 @@ class MissMap:
 
     def lookup_synonyms_manually(self, taxon):
         syns = []
+        taxid = None
         try:
             # taxonomy search by scientific name
             with Entrez.esearch(
@@ -396,9 +397,12 @@ class MissMap:
                 ids = res.get("IdList", [])
 
             if not ids:
-                return syns
+                return syns, taxid  # no synonyms, no taxid
 
-            with Entrez.efetch(db="taxonomy", id=ids[0], retmode="xml") as q:
+            # Take the first taxonomy ID (could refine later if needed)
+            taxid = ids[0]
+
+            with Entrez.efetch(db="taxonomy", id=taxid, retmode="xml") as q:
                 xml = q.read()
 
             root = ET.fromstring(xml)
@@ -412,7 +416,8 @@ class MissMap:
                         syns.append(txt)
         except Exception as e:
             self.handle_errors(e)
-        return syns
+        return syns, taxid
+
 
     def _filter_infraspecific(self, names, species):
         """
@@ -436,41 +441,53 @@ class MissMap:
         return filtered
 
     def data_counts(self):
-        """Query NCBI for each species × datatype using species + synonyms, and collect counts + synonyms."""
+        """Query NCBI for each species × datatype, using TaxID when available, and collect counts + synonyms."""
         for species in self.species_list:
             row = {"Species": species}
 
-            # 1) Get manual + AI synonyms FIRST
-            manual = self.lookup_synonyms_manually(species)
+            # 1) Get manual synonyms + TaxID from taxonomy
+            manual, taxid = self.lookup_synonyms_manually(species)
+
+            # 2) AI enrichment (uses manual list only)
             ai_extra = self.lookup_synonyms_with_ai(species, manual)
+
             # include the original species name in the set
             all_names = [species] + (manual or []) + (ai_extra or [])
             # deduplicate and strip
             all_names = sorted(set(n.strip() for n in all_names if n.strip()))
 
-            # optionally drop subspecies/varieties
+            # optionally drop subspecies/varieties (only affects display + AI, not TaxID)
             all_names = self._filter_infraspecific(all_names, species)
 
             # save synonyms (without duplicating the original species name)
             syn_only = [n for n in all_names if n.lower() != species.lower()]
             row["synonyms"] = ",".join(syn_only)
 
-            # 2) Build OR query over all names for the Organism field
-            if all_names:
-                organism_query = " OR ".join(
-                    [f'"{name}"[Organism]' for name in all_names]
-                )
-            else:
-                # fallback to just the original species if something weird happened
-                organism_query = f'"{species}"[Organism]'
+            # 3) Decide whether to use TaxID or fall back to name-based search
+            use_taxid = taxid is not None
 
-            organism_query = f"({organism_query})"
+            # Name-based fallback query if TaxID is missing
+            organism_query = None
+            if not use_taxid:
+                if all_names:
+                    organism_query = " OR ".join(
+                        [f'"{name}"[Organism]' for name in all_names]
+                    )
+                else:
+                    organism_query = f'"{species}"[Organism]'
+                organism_query = f"({organism_query})"
 
             total_count = 0
 
-            # 3) For each datatype, search using species + synonyms
+            # 4) For each datatype, search nuccore
             for dt in self.dt_list:
-                term = f'{organism_query} AND {self.FILTERS[dt]}'
+                if use_taxid:
+                    # TaxID-based search (preferred, more robust)
+                    term = f"txid{taxid}[Organism:exp] AND {self.FILTERS[dt]}"
+                else:
+                    # Fallback: name-based search using species + synonyms
+                    term = f"{organism_query} AND {self.FILTERS[dt]}"
+
                 count = 0
                 try:
                     with Entrez.esearch(
@@ -493,33 +510,45 @@ class MissMap:
                 row[dt] = str(count)
                 time.sleep(self.delay)
 
-            # 4) Sum across datatypes
+            # 5) Sum across datatypes
             row["Total Count of Data Found"] = str(total_count)
 
-            # 5) Total NCBI (no filters), also using species + synonyms
+            # 6) Total NCBI (no filters)
             total_all = 0
             try:
+                if use_taxid:
+                    base_term = f"txid{taxid}[Organism:exp]"
+                else:
+                    base_term = organism_query
+
                 with Entrez.esearch(
                     db="nuccore",
-                    term=organism_query,
+                    term=base_term,
                     retmax=0
                 ) as q:
                     rec = Entrez.read(q)
                 total_all = int(rec.get("Count", 0))
             except Exception as e:
                 self.handle_errors(
-                    f"Error getting total unfiltered count for '{species}' (with synonyms): {e}"
+                    f"Error getting total unfiltered count for '{species}': {e}"
                 )
 
             row["Total NCBI (no filters)"] = str(total_all)
 
             if total_count == 0:
-                print(
-                    f'[WARN] No sequence data found for "{species}" (including synonyms) – '
-                    f"check spelling or filters."
-                )
+                if use_taxid:
+                    print(
+                        f'[WARN] No sequence data found for "{species}" (TaxID {taxid}) – '
+                        f"check spelling, taxon resolution, or filters."
+                    )
+                else:
+                    print(
+                        f'[WARN] No sequence data found for "{species}" (name-based search) – '
+                        f"check spelling or filters."
+                    )
 
             self.rows.append(row)
+
 
     def display_and_save_matrix(self):
         df = pd.DataFrame(self.rows)
