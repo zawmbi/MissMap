@@ -1,7 +1,0 @@
-Species,chloroplast,mitochondrion,nuclear,transcriptome,RefSeq,WGS,rbcL,matK,ITS,trnL,psbA-trnH,atpF-atpH,psbK-psbI,rpoB,rpoC1,ycf1,ndhF,Total Count of Data Found,Total NCBI (no filters),synonyms
-Solanum lycopersicum,20,46,433368,319070,59892,329,103,56,133,14,6,41,0,42,42,40,41,813243,812535,"Lycopersicon esculentum,Lycopersicon esculentum var. esculentum,Solanum esculentum,Solanum lycopersicum var. humboldtii,tomato"
-arabidopsis thaliana,53,197,920184,1610492,53835,6421,49,42,28,37,2,12,0,22,15,15,23,2591427,2703313,"Arabis thaliana,thale cress"
-zea mays,4,442,2616405,2191663,77385,30406,69,79,84,15,0,60,0,60,60,0,61,4916793,4887357,Zea mays var. japonica
-oryza sativa,12,315,920653,1321203,55746,22889,468,225,124,31,5,29,10,42,47,1,32,2321832,2298885,Asian cultivated rice
-lemna gibba,0,2,171,32,0,0,15,13,1,0,4,13,9,9,6,0,0,275,203,swollen duckweed
-Linum usitatissimum,0,0,91114,289559,1,94,20,23,21,3,11,5,0,6,6,5,8,380876,380676,flax
