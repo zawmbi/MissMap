@@ -35,12 +35,10 @@ $ python MissMap.py -e yourncbiemail@address.com -k yourapikeylettersandnumbers 
 Manual entry without email and API key using config file (recommended): 
 $ python MissMap.py -s "species1" -dt "rbcL,matK,ITS" -c config.txt
 
-Storing email & API key and Azure settings in your environment (config.txt):
+Storing email & API key and Groq settings in your environment (config.txt):
 # email yourncbiemail@address.com
-# apikey yourapikeylettersandnumbers
-# AZURE_API_KEY_AZURE yourazureapikey
-# AZURE_API_VERSION 2024-02-01
-# AZURE_API_BASE https://your-azure-endpoint.openai.azure.com/
+# GROQ_API_KEY
+# GROQ_MODEL
 
 You can also optionally set:
 # species Arabidopsis thaliana,Zea mays
@@ -87,7 +85,7 @@ def get_llm_client(configfile):
     cfg = read_config(configfile)
 
     api_key = cfg.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
-    model = cfg.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    model = cfg.get("GROQ_MODEL", "")
 
     if not api_key:
         raise KeyError(
@@ -298,7 +296,7 @@ class MissMap:
         "nuclear":       "biomol_genomic[PROP] NOT srcdb_refseq[PROP]",
         "transcriptome": "biomol_mrna[PROP] NOT srcdb_refseq[PROP]",
         "RefSeq":        "srcdb_refseq[PROP]",
-        "WGS":           "wgs[filter]",
+        "WGS":           "wgs[All Fields]",
         "rbcL":          "\"rbcL\"[Gene]",
         "matK":          "\"matK\"[Gene]",
         "ITS":           "internal transcribed spacer[All Fields]",
