@@ -1,3 +1,4 @@
 config.txt
 missmap_results/
 AI_prompt_isolated.py
+.env
