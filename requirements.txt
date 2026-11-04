@@ -1,0 +1,13 @@
+# MissMap runtime + dev dependencies (pinned to a tested, working set).
+# Install with:  pip install -r requirements.txt
+
+# --- Core runtime ---
+biopython==1.86        # NCBI Entrez access
+pandas==2.3.1          # output matrix / CSV / Excel
+numpy==1.26.4          # numeric matrix for the heatmap
+requests==2.32.2       # Groq API calls
+matplotlib==3.8.4      # presence/absence + count heatmaps
+openpyxl==3.1.2        # .xlsx export engine
+
+# --- Dev / test ---
+pytest==7.4.4          # unit tests with mocked Entrez (test_missmap.py)

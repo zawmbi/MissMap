@@ -7,10 +7,11 @@ import time                 # to delay API calls
 import argparse             # accepting terminal input
 import pandas as pd         # dataframe for the output matrix
 from Bio import Entrez      # accessing NCBI Entrez API
-from urllib.error import HTTPError  # handles API request errors
+from urllib.error import HTTPError, URLError  # handles API request errors
 from xml.etree import ElementTree as ET  # parse XML from NCBI
 import requests             # Groq API calls
 import json                 # parse JSON from LLM
+import re                   # infraspecific-rank detection
 
 # ======================================================================
 #  MissMap: A pipeline for visualizing sequence data availability in
@@ -45,10 +46,15 @@ You can also optionally set:
 # datatypes chloroplast,mitochondrion,rbcL
 
 Optional flags:
---verbose        Print per-datatype progress and count details.
---ai-unverified  Allow AI synonyms not validated in NCBI taxonomy.
---debug-queries  Print exact NCBI query strings used for counts.
+--verbose         Print per-datatype progress and count details.
+--ai-unverified   Allow AI synonyms not validated in NCBI taxonomy.
+--debug-queries   Print exact NCBI query strings used for counts.
 --ai-validated-only  Use only NCBI-validated AI synonyms in searches (strict).
+--no-subspecies   Exclude infraspecific/hybrid names from synonym search.
+--non-interactive Never prompt; fail if required inputs are missing (HPC/batch/CI).
+
+Outputs (in missmap_results/): matrix CSV/XLSX, presence/absence + count
+heatmaps (PNG), a coverage summary CSV, and a JSON run manifest.
 
 AI Disclaimer:
 AI output can vary by model and input context. Synonym lists may differ across runs,
@@ -58,6 +64,38 @@ models, or prompt updates. Treat AI synonyms as suggestions to be verified.
 """
 
 RESULTS_DIR = "missmap_results"
+
+# ----------------------------------------------------------------------
+# Counting reliability constants
+# ----------------------------------------------------------------------
+# Sentinel for "the query failed and we do NOT know the count". This is kept
+# strictly distinct from an integer 0 (a genuine "no records") so a transient
+# network blip is never silently recorded as a biological absence.
+COUNT_NA = None
+NA_LABEL = "NA"
+
+# HTTP status codes worth retrying (rate limiting + transient server errors).
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+# Total attempts = 1 initial + MAX_RETRIES retries.
+MAX_RETRIES = 4
+# Exponential backoff: wait = BACKOFF_BASE * 2**attempt (seconds).
+BACKOFF_BASE = 1.0
+
+
+def _is_retryable_error(err):
+    """True if an Entrez/urllib error is a transient condition worth retrying."""
+    if isinstance(err, HTTPError):
+        return getattr(err, "code", None) in RETRYABLE_HTTP
+    if isinstance(err, URLError):
+        return True  # DNS / connection reset / timeout at the network layer
+    # Biopython raises RuntimeError carrying NCBI's own error text for some
+    # rate-limit / server conditions; sniff the message as a last resort.
+    msg = str(err).lower()
+    transient_markers = (
+        "429", "too many requests", "500", "502", "503", "504",
+        "timeout", "timed out", "temporarily", "try again", "connection reset",
+    )
+    return any(t in msg for t in transient_markers)
 
 # ======================================================================
 # === AI-BASED SYNONYM ENRICHMENT HELPERS (Groq) =======================
@@ -223,8 +261,7 @@ def lookup_synonyms_with_ai(species, manual_list, llm):
 # ======================================================================
 class Configuration:
     def __init__(self, config_file):
-        self.config_file       = config_file   # used by Terminal inputs and Entrez
-        self.azure_config_file = config_file   # reuse same for LLM creds
+        self.config_file       = config_file   # used by Terminal inputs, Entrez, and LLM creds
         self.email             = None
         self.api_key           = None
         self.species           = None         # list of species
@@ -235,6 +272,9 @@ class Configuration:
         self.verbose           = False        # verbose progress output
         self.debug_queries     = False        # print exact NCBI query strings
         self.ai_validated_only = False        # only use NCBI-validated AI synonyms in searches
+        # Non-interactive: never block on input() (for HPC/batch/CI). Auto-on
+        # when stdin is not a TTY; can also be forced with --non-interactive.
+        self.non_interactive   = not sys.stdin.isatty()
 
     def load_config(self):
         """Load email, api_key, species, and datatypes from config file."""
@@ -289,21 +329,27 @@ class Configuration:
                             help="Print exact NCBI query strings used for counts.")
         parser.add_argument("--ai-validated-only", action="store_true",
                             help="Use only NCBI-validated AI synonyms in searches (strict mode).")
+        parser.add_argument("--non-interactive", action="store_true",
+                            help="Never prompt; fail if required inputs are missing (HPC/batch/CI).")
         args = parser.parse_args()
 
         # Optional override of config file
         if args.configfile:
             self.config_file       = args.configfile
-            self.azure_config_file = args.configfile
             # reload config with new file path
             self.load_config()
+
+        # Non-interactive mode: CLI flag forces it; otherwise inherit the
+        # TTY-based default set in __init__.
+        if args.non_interactive:
+            self.non_interactive = True
 
         # Email
         if args.email:
             self.email = args.email
         elif not self.email and os.getenv("ENTREZ_EMAIL"):
             self.email = os.getenv("ENTREZ_EMAIL")
-        elif not self.email:
+        elif not self.email and not self.non_interactive:
             e = input("NCBI Email Address (press Enter to skip): ").strip()
             if e:
                 self.email = e
@@ -313,7 +359,7 @@ class Configuration:
             self.api_key = args.apikey
         elif not self.api_key and os.getenv("ENTREZ_API_KEY"):
             self.api_key = os.getenv("ENTREZ_API_KEY")
-        elif not self.api_key:
+        elif not self.api_key and not self.non_interactive:
             k = input("API Key (press Enter to skip): ").strip()
             if k:
                 self.api_key = k
@@ -364,7 +410,15 @@ class MissMap:
         "ndhF":          "\"ndhF\"[Gene]",
     }
 
-    def __init__(self, exclude_infraspecific=False, ai_unverified=False, verbose=False, debug_queries=False, ai_validated_only=False):
+    # Datatypes that count large genomic resources (whole chromosomes, WGS
+    # contigs, every mRNA). Their magnitudes dwarf barcode markers, so the
+    # visualisation groups and scales them separately rather than adding them.
+    GENOMIC_CATEGORIES = {
+        "chloroplast", "mitochondrion", "nuclear", "transcriptome", "RefSeq", "WGS",
+    }
+
+    def __init__(self, exclude_infraspecific=False, ai_unverified=False, verbose=False,
+                 debug_queries=False, ai_validated_only=False, non_interactive=False):
         os.makedirs(RESULTS_DIR, exist_ok=True)
         self.species_list = []
         self.dt_list      = []
@@ -375,15 +429,21 @@ class MissMap:
         self.verbose = verbose
         self.debug_queries = debug_queries
         self.ai_validated_only = ai_validated_only
+        self.non_interactive = non_interactive
         self._tax_name_cache = {}  # cache taxonomy lookups by name
+
+        # Reliability / reproducibility bookkeeping.
+        self._failed_cells = []     # list of (species, datatype) that returned NA
+        self._matrix_records = []   # numeric per-species rows for the heatmap
+        self.run_started = time.strftime("%Y-%m-%d %H:%M:%S %z")
 
         # Be a bit more conservative if no API key is set.
         self.delay = 0.12 if getattr(Entrez, "api_key", None) else 0.4
 
-    def init_ai_client(self, azure_config_file):
+    def init_ai_client(self, config_file):
         """Initialize Groq LLM config for synonym enrichment (reusing config file path)."""
         try:
-            self.llm = get_llm_client(azure_config_file)
+            self.llm = get_llm_client(config_file)
             print("[INFO] Groq client config initialized for synonym enrichment.")
         except Exception as e:
             print(f"[WARN] Could not initialize Groq client: {e}")
@@ -395,6 +455,10 @@ class MissMap:
         return lookup_synonyms_with_ai(species, manual_list, self.llm)
 
     def ask_species(self):
+        if self.non_interactive:
+            print("[ERROR] No species provided and running non-interactively. "
+                  "Pass -s/--species or set 'species' in the config. Exiting.")
+            sys.exit(2)
         inp = input("Enter species (comma-separated): ")
         for sp in inp.split(","):
             sp = sp.strip()
@@ -405,6 +469,11 @@ class MissMap:
             sys.exit(1)
 
     def ask_data_types(self):
+        if self.non_interactive:
+            # Sensible default for batch use: run the full predefined set.
+            print("[INFO] No datatypes provided; running all predefined datatypes (non-interactive).")
+            self.dt_list = list(self.FILTERS.keys())
+            return
         print("Predefined data types:", ", ".join(self.FILTERS.keys()))
         inp = input("Enter data types or press Enter for all: ")
         if not inp.strip():
@@ -431,6 +500,54 @@ class MissMap:
 
     def handle_errors(self, e):
         print(f"[ERROR] {e}")
+
+    @staticmethod
+    def _fmt(value):
+        """Render a count for output: integers as-is, the NA sentinel as 'NA'."""
+        return NA_LABEL if value is COUNT_NA else str(value)
+
+    def _esearch_count(self, term, context=""):
+        """
+        Run an nuccore esearch and return an integer record count, or COUNT_NA
+        (None) if the query fails after retries.
+
+        This is the single seam through which every count flows. It:
+          * distinguishes a genuine 0 from an error (returns None, never 0, on
+            failure) so a network blip is never recorded as a real absence;
+          * retries transient HTTP 429/5xx and network errors with exponential
+            backoff, honouring NCBI's rate limits;
+          * sleeps self.delay after a *successful* call to pace requests.
+        """
+        last_err = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with Entrez.esearch(db="nuccore", term=term, retmax=0) as q:
+                    rec = Entrez.read(q)
+                # A well-formed esearch response always carries "Count".
+                # Its absence means we got something we can't trust -> treat as
+                # an error rather than defaulting to 0.
+                if "Count" not in rec:
+                    raise ValueError("Entrez response missing 'Count' field")
+                time.sleep(self.delay)  # pace only after a real success
+                return int(rec["Count"])
+            except Exception as e:  # noqa: BLE001 - we re-raise/inspect below
+                last_err = e
+                if attempt < MAX_RETRIES and _is_retryable_error(e):
+                    wait = BACKOFF_BASE * (2 ** attempt)
+                    if self.verbose:
+                        print(
+                            f"[RETRY] {context or term}: {type(e).__name__} "
+                            f"({e}); attempt {attempt + 1}/{MAX_RETRIES}, "
+                            f"waiting {wait:.1f}s"
+                        )
+                    time.sleep(wait)
+                    continue
+                break
+
+        # Exhausted retries (or non-transient failure): record NA, not 0.
+        self.handle_errors(f"{context or term}: query failed, recording NA ({last_err})")
+        self._failed_cells.append(context or term)
+        return COUNT_NA
 
     def lookup_synonyms_manually(self, taxon):
         syns = []
@@ -476,9 +593,24 @@ class MissMap:
         return syns, taxid
 
 
+    # Infraspecific / hybrid rank connectors. Matched as whole tokens so we
+    # catch 'var.', 'subsp.', 'ssp.', 'f.', 'forma', 'nothosubsp.', 'subvar.'
+    # and the hybrid marker '×' regardless of position -- not just the two
+    # space-padded substrings the original code looked for.
+    _INFRASPECIFIC_RE = re.compile(
+        r"(?:^|\s)(?:var|subsp|ssp|subvar|nothosubsp|nothovar|forma|subf|f|cv)\.?(?:\s|$)"
+        r"|(?:^|\s)[×x](?:\s|$)"
+        r"|×",  # multiplication sign anywhere (hybrid)
+        re.IGNORECASE,
+    )
+
+    def _is_infraspecific(self, name):
+        """Heuristically decide if a name denotes an infraspecific/hybrid taxon."""
+        return bool(self._INFRASPECIFIC_RE.search(name))
+
     def _filter_infraspecific(self, names, species):
         """
-        Optionally drop infraspecific names (var., subsp.) from the list.
+        Optionally drop infraspecific/hybrid names from the list.
         Keeps the original species name regardless.
         """
         if not self.exclude_infraspecific:
@@ -486,13 +618,11 @@ class MissMap:
 
         filtered = []
         for n in names:
-            low = n.lower()
             # Always keep the canonical species name
-            if low == species.lower():
+            if n.lower() == species.lower():
                 filtered.append(n)
                 continue
-            # Drop infraspecific ranks if they look like 'var.' or 'subsp.'
-            if " var. " in low or " subsp. " in low:
+            if self._is_infraspecific(n):
                 continue
             filtered.append(n)
         return filtered
@@ -617,7 +747,9 @@ class MissMap:
             # Name-based fallback query if TaxID is missing (used for main counts)
             organism_query = organism_query_expanded
 
-            total_count = 0
+            # numeric_counts holds the authoritative (TaxID-based when available)
+            # per-datatype count for this species: int, or COUNT_NA on failure.
+            numeric_counts = {}
             name_based_total_base = 0
             name_based_total_expanded = 0
 
@@ -634,66 +766,31 @@ class MissMap:
                 if self.debug_queries:
                     print(f"[QUERY] {species} | {dt} | primary: {term}")
 
-                count = 0
-                try:
-                    with Entrez.esearch(
-                        db="nuccore",
-                        term=term,
-                        retmax=0
-                    ) as q:
-                        rec = Entrez.read(q)
-                    count = int(rec.get("Count", 0))
-                    total_count += count
-                except HTTPError as e:
-                    self.handle_errors(
-                        f"HTTP error for species '{species}', datatype '{dt}': {e}"
-                    )
-                except Exception as e:
-                    self.handle_errors(
-                        f"Error for species '{species}', datatype '{dt}': {e}"
-                    )
-
-                row[dt] = str(count)
+                count = self._esearch_count(term, context=f"{species} | {dt} | primary")
+                numeric_counts[dt] = count
+                row[dt] = self._fmt(count)
                 if self.verbose:
-                    print(f"[INFO] {species} | {dt} | TaxID/primary count: {count}")
-                time.sleep(self.delay)
+                    print(f"[INFO] {species} | {dt} | TaxID/primary count: {self._fmt(count)}")
 
-                # Name-based comparison counts (NCBI synonyms vs NCBI+AI)
-                try:
-                    with Entrez.esearch(
-                        db="nuccore",
-                        term=f"{organism_query_base} AND {self.FILTERS[dt]}",
-                        retmax=0
-                    ) as q:
-                        rec = Entrez.read(q)
-                    base_count = int(rec.get("Count", 0))
-                except Exception as e:
-                    self.handle_errors(
-                        f"Error for name-based NCBI synonyms '{species}', datatype '{dt}': {e}"
-                    )
-                    base_count = 0
-                time.sleep(self.delay)
-
-                try:
-                    with Entrez.esearch(
-                        db="nuccore",
-                        term=f"{organism_query_expanded} AND {self.FILTERS[dt]}",
-                        retmax=0
-                    ) as q:
-                        rec = Entrez.read(q)
-                    expanded_count = int(rec.get("Count", 0))
-                except Exception as e:
-                    self.handle_errors(
-                        f"Error for name-based NCBI+AI '{species}', datatype '{dt}': {e}"
-                    )
-                    expanded_count = 0
-                time.sleep(self.delay)
-
-                name_based_total_base += base_count
-                name_based_total_expanded += expanded_count
+                # Name-based comparison counts (NCBI synonyms vs NCBI+AI).
+                # NA cells are skipped from the running totals rather than
+                # silently treated as zero.
+                base_count = self._esearch_count(
+                    f"{organism_query_base} AND {self.FILTERS[dt]}",
+                    context=f"{species} | {dt} | name-based NCBI",
+                )
+                expanded_count = self._esearch_count(
+                    f"{organism_query_expanded} AND {self.FILTERS[dt]}",
+                    context=f"{species} | {dt} | name-based NCBI+AI",
+                )
+                if isinstance(base_count, int):
+                    name_based_total_base += base_count
+                if isinstance(expanded_count, int):
+                    name_based_total_expanded += expanded_count
                 if self.verbose:
                     print(
-                        f"[INFO] {species} | {dt} | Name-based NCBI: {base_count} | NCBI+AI: {expanded_count}"
+                        f"[INFO] {species} | {dt} | Name-based NCBI: {self._fmt(base_count)} "
+                        f"| NCBI+AI: {self._fmt(expanded_count)}"
                     )
                 if self.debug_queries:
                     print(
@@ -703,8 +800,29 @@ class MissMap:
                         f"[QUERY] {species} | {dt} | name-based NCBI+AI: {organism_query_expanded} AND {self.FILTERS[dt]}"
                     )
 
-            # 5) Sum across datatypes
-            row["Total Count of Data Found"] = str(total_count)
+            # 5) Aggregate across datatypes.
+            #    The SUM double-counts: one record (e.g. a chloroplast genome)
+            #    matches chloroplast, WGS, rbcL, matK, ycf1, ndhF at once. It is
+            #    reported only as an overlapping tally, never as a record count.
+            valid_counts = [c for c in numeric_counts.values() if c is not COUNT_NA]
+            na_cells = sum(1 for c in numeric_counts.values() if c is COUNT_NA)
+            sum_overlapping = sum(valid_counts)
+
+            # 5b) DEDUPLICATED UNION: records matching AT LEAST ONE selected
+            #     filter. OR-combining inside a single query lets NCBI dedupe,
+            #     giving a true record count (always <= Total NCBI no-filters).
+            filter_union = " OR ".join(f"({self.FILTERS[dt]})" for dt in self.dt_list)
+            if use_taxid:
+                union_term = f"txid{taxid}[Organism:exp] AND ({filter_union})"
+            else:
+                union_term = f"{organism_query} AND ({filter_union})"
+            if self.debug_queries:
+                print(f"[QUERY] {species} | union (dedup): {union_term}")
+            union_count = self._esearch_count(union_term, context=f"{species} | union")
+
+            row["Records w/ >=1 Selected Marker (deduplicated)"] = self._fmt(union_count)
+            row["Sum of Marker Counts (overlapping, not a record count)"] = str(sum_overlapping)
+            row["Cells Failed (NA)"] = str(na_cells)
             row["Name-based Total (NCBI Synonyms)"] = str(name_based_total_base)
             row["Name-based Total (NCBI+AI)"] = str(name_based_total_expanded)
             row["Name-based Total Gain (AI - NCBI)"] = str(
@@ -712,72 +830,54 @@ class MissMap:
             )
 
             # 6) Total NCBI (no filters)
-            total_all = 0
-            total_all_base = 0
-            total_all_expanded = 0
-            try:
-                if use_taxid:
-                    base_term = f"txid{taxid}[Organism:exp]"
-                else:
-                    base_term = organism_query
-
-                with Entrez.esearch(
-                    db="nuccore",
-                    term=base_term,
-                    retmax=0
-                ) as q:
-                    rec = Entrez.read(q)
-                total_all = int(rec.get("Count", 0))
-            except Exception as e:
-                self.handle_errors(
-                    f"Error getting total unfiltered count for '{species}': {e}"
-                )
-
-            row["Total NCBI (no filters)"] = str(total_all)
+            if use_taxid:
+                base_term = f"txid{taxid}[Organism:exp]"
+            else:
+                base_term = organism_query
+            total_all = self._esearch_count(base_term, context=f"{species} | no-filter primary")
+            row["Total NCBI (no filters)"] = self._fmt(total_all)
             if self.debug_queries:
                 print(f"[QUERY] {species} | no-filter primary: {base_term}")
 
+            # Sanity invariant: a deduplicated subset cannot exceed the whole.
+            if (isinstance(union_count, int) and isinstance(total_all, int)
+                    and union_count > total_all):
+                print(
+                    f"[WARN] {species}: union count ({union_count}) exceeds unfiltered "
+                    f"total ({total_all}); check filter/scoping consistency."
+                )
+
             # Name-based unfiltered comparison (NCBI synonyms vs NCBI+AI)
-            try:
-                with Entrez.esearch(
-                    db="nuccore",
-                    term=organism_query_base,
-                    retmax=0
-                ) as q:
-                    rec = Entrez.read(q)
-                total_all_base = int(rec.get("Count", 0))
-            except Exception as e:
-                self.handle_errors(
-                    f"Error getting name-based total (NCBI synonyms) for '{species}': {e}"
-                )
-                total_all_base = 0
-            time.sleep(self.delay)
-
-            try:
-                with Entrez.esearch(
-                    db="nuccore",
-                    term=organism_query_expanded,
-                    retmax=0
-                ) as q:
-                    rec = Entrez.read(q)
-                total_all_expanded = int(rec.get("Count", 0))
-            except Exception as e:
-                self.handle_errors(
-                    f"Error getting name-based total (NCBI+AI) for '{species}': {e}"
-                )
-                total_all_expanded = 0
-            time.sleep(self.delay)
-
-            row["Name-based NCBI (no filters)"] = str(total_all_base)
-            row["Name-based NCBI+AI (no filters)"] = str(total_all_expanded)
-            row["Name-based Gain (no filters)"] = str(
-                total_all_expanded - total_all_base
+            total_all_base = self._esearch_count(
+                organism_query_base, context=f"{species} | no-filter name-based NCBI"
             )
+            total_all_expanded = self._esearch_count(
+                organism_query_expanded, context=f"{species} | no-filter name-based NCBI+AI"
+            )
+            row["Name-based NCBI (no filters)"] = self._fmt(total_all_base)
+            row["Name-based NCBI+AI (no filters)"] = self._fmt(total_all_expanded)
+            if isinstance(total_all_base, int) and isinstance(total_all_expanded, int):
+                row["Name-based Gain (no filters)"] = str(total_all_expanded - total_all_base)
+            else:
+                row["Name-based Gain (no filters)"] = NA_LABEL
             if self.debug_queries:
                 print(f"[QUERY] {species} | no-filter name-based NCBI: {organism_query_base}")
                 print(f"[QUERY] {species} | no-filter name-based NCBI+AI: {organism_query_expanded}")
 
-            if total_count == 0:
+            # Record-keeping for the heatmap / coverage summary.
+            self._matrix_records.append({
+                "Species": species,
+                "taxid": taxid,
+                "counts": dict(numeric_counts),
+                "union": union_count,
+                "total_all": total_all,
+            })
+
+            if na_cells:
+                print(f"[WARN] {species}: {na_cells} datatype cell(s) recorded as NA (query failure).")
+
+            union_is_zero = (union_count == 0)
+            if union_is_zero or (union_count is COUNT_NA and not valid_counts):
                 if use_taxid:
                     print(
                         f'[WARN] No sequence data found for "{species}" (TaxID {taxid}) – '
@@ -792,6 +892,260 @@ class MissMap:
             self.rows.append(row)
 
 
+    # ------------------------------------------------------------------
+    # Ordered columns: genomic categories first, then barcode markers,
+    # preserving the user's dt_list order within each group.
+    # ------------------------------------------------------------------
+    def _ordered_datatypes(self):
+        genomic = [dt for dt in self.dt_list if dt in self.GENOMIC_CATEGORIES]
+        markers = [dt for dt in self.dt_list if dt not in self.GENOMIC_CATEGORIES]
+        return genomic, markers
+
+    def save_heatmap(self, ts):
+        """
+        Render the species x datatype availability map(s) -- the "map" in
+        MissMap. Produces two PNGs:
+          * presence/absence/NA grid (neutralises the huge granularity gap
+            between genome-scale categories and single-amplicon barcodes);
+          * log10(count+1) magnitude grid for relative depth.
+        Genomic categories and barcode markers are grouped with a divider so
+        they are never read as an additive whole.
+        """
+        if not self._matrix_records:
+            print("[INFO] No data to plot; skipping heatmap.")
+            return []
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import ListedColormap, BoundaryNorm
+            from matplotlib.patches import Patch
+            import numpy as np
+        except Exception as e:  # pragma: no cover - environment dependent
+            print(f"[WARN] Plotting libraries unavailable; skipping heatmap: {e}")
+            return []
+
+        species = [r["Species"] for r in self._matrix_records]
+        genomic, markers = self._ordered_datatypes()
+        cols = genomic + markers
+        if not cols or not species:
+            print("[INFO] Nothing to plot; skipping heatmap.")
+            return []
+        divider = len(genomic)  # boundary between groups (0 if no genomic cols)
+
+        n_rows, n_cols = len(species), len(cols)
+        counts = np.full((n_rows, n_cols), np.nan)
+        for i, rec in enumerate(self._matrix_records):
+            for j, dt in enumerate(cols):
+                c = rec["counts"].get(dt, COUNT_NA)
+                counts[i, j] = np.nan if c is COUNT_NA else float(c)
+
+        figw = max(6.0, 0.7 * n_cols + 3.0)
+        figh = max(3.0, 0.55 * n_rows + 2.0)
+        annotate = (n_rows * n_cols) <= 400  # avoid unreadable clutter
+        saved = []
+
+        def _decorate(ax):
+            ax.set_xticks(range(n_cols))
+            ax.set_xticklabels(cols, rotation=45, ha="right", fontsize=8)
+            ax.set_yticks(range(n_rows))
+            ax.set_yticklabels(species, fontstyle="italic", fontsize=8)
+            ax.set_xticks([x - 0.5 for x in range(1, n_cols + 1)], minor=True)
+            ax.set_yticks([y - 0.5 for y in range(1, n_rows + 1)], minor=True)
+            ax.grid(which="minor", color="white", linewidth=1.0)
+            ax.tick_params(which="minor", length=0)
+            if 0 < divider < n_cols:
+                ax.axvline(divider - 0.5, color="black", linewidth=2.0)
+
+        # ---- Figure 1: presence / absence / NA -------------------------------
+        # states: 0 absent, 1 present, 2 NA(query failed)
+        state = np.where(np.isnan(counts), 2.0, (counts > 0).astype(float))
+        cmap = ListedColormap(["#eef1f5", "#2c7fb8", "#e34a33"])
+        norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
+        fig, ax = plt.subplots(figsize=(figw, figh))
+        ax.imshow(state, cmap=cmap, norm=norm, aspect="auto")
+        _decorate(ax)
+        if annotate:
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    c = counts[i, j]
+                    label = "NA" if np.isnan(c) else f"{int(c):,}"
+                    txt_color = "white" if (not np.isnan(c) and c > 0) else "#333333"
+                    ax.text(j, i, label, ha="center", va="center",
+                            fontsize=6.5, color=txt_color)
+        ax.set_title("MissMap: sequence data presence / absence", fontsize=11)
+        legend = [
+            Patch(facecolor="#2c7fb8", label="present (>=1 record)"),
+            Patch(facecolor="#eef1f5", label="absent (0 records)"),
+            Patch(facecolor="#e34a33", label="NA (query failed)"),
+        ]
+        ax.legend(handles=legend, bbox_to_anchor=(1.01, 1.0),
+                  loc="upper left", fontsize=7, frameon=False)
+        if 0 < divider < n_cols:
+            ax.text(0, 1.02, "genomic <-", transform=ax.transAxes, fontsize=7, color="#555")
+            ax.text(1.0, 1.02, "-> markers", transform=ax.transAxes, fontsize=7,
+                    color="#555", ha="right")
+        path1 = os.path.join(RESULTS_DIR, f"missmap_presence_{ts}.png")
+        fig.savefig(path1, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(path1)
+        print(f"Saved presence/absence map to {path1}")
+
+        # ---- Figure 2: log10(count+1) magnitude ------------------------------
+        log_counts = np.log10(counts + 1.0)  # NaN stays NaN
+        fig, ax = plt.subplots(figsize=(figw, figh))
+        cmap2 = plt.get_cmap("viridis").copy()
+        cmap2.set_bad(color="#e34a33")  # NA cells show red
+        im = ax.imshow(log_counts, cmap=cmap2, aspect="auto")
+        _decorate(ax)
+        if annotate:
+            vmax = np.nanmax(log_counts) if np.isfinite(np.nanmax(log_counts)) else 1.0
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    c = counts[i, j]
+                    label = "NA" if np.isnan(c) else f"{int(c):,}"
+                    shade = 0.0 if np.isnan(log_counts[i, j]) else log_counts[i, j] / max(vmax, 1e-9)
+                    txt_color = "white" if shade > 0.55 else "black"
+                    ax.text(j, i, label, ha="center", va="center",
+                            fontsize=6.5, color=txt_color)
+        cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        cbar.set_label("log10(count + 1)", fontsize=8)
+        ax.set_title("MissMap: sequence data magnitude", fontsize=11)
+        path2 = os.path.join(RESULTS_DIR, f"missmap_counts_{ts}.png")
+        fig.savefig(path2, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(path2)
+        print(f"Saved count magnitude map to {path2}")
+        return saved
+
+    # Standard land-plant barcode markers, for the gap report.
+    CORE_BARCODES = ["rbcL", "matK", "ITS", "trnL", "psbA-trnH"]
+
+    def save_coverage_summary(self, ts):
+        """
+        Per-marker coverage across the species set (actionable for sampling
+        decisions) plus a gap list for the standard barcodes. Writes a CSV and
+        prints a concise table. Returns the CSV path.
+        """
+        if not self._matrix_records:
+            return None
+        rows = []
+        for dt in self.dt_list:
+            present = absent = na = 0
+            for rec in self._matrix_records:
+                c = rec["counts"].get(dt, COUNT_NA)
+                if c is COUNT_NA:
+                    na += 1
+                elif c > 0:
+                    present += 1
+                else:
+                    absent += 1
+            known = present + absent
+            pct = round(100.0 * present / known, 1) if known else NA_LABEL
+            rows.append({
+                "Datatype": dt,
+                "Group": "genomic" if dt in self.GENOMIC_CATEGORIES else "marker",
+                "Species with data": present,
+                "Species without data": absent,
+                "Species NA": na,
+                "Coverage % (of known)": pct,
+            })
+        cov = pd.DataFrame(rows)
+        path = os.path.join(RESULTS_DIR, f"coverage_summary_{ts}.csv")
+        cov.to_csv(path, index=False)
+
+        print("\n#==== Marker coverage across species ====#\n")
+        print(cov.to_string(index=False))
+        print("\n#========================================#\n")
+
+        # Gap list: which species lack each core barcode.
+        core = [b for b in self.CORE_BARCODES if b in self.dt_list]
+        if core:
+            print("Core-barcode gaps (species missing each marker):")
+            for b in core:
+                missing = [
+                    rec["Species"] for rec in self._matrix_records
+                    if rec["counts"].get(b, COUNT_NA) == 0
+                ]
+                if missing:
+                    print(f"  {b}: {', '.join(missing)}")
+                else:
+                    print(f"  {b}: (none missing)")
+            print("")
+        print(f"Saved coverage summary to {path}")
+        return path
+
+    def save_manifest(self, ts):
+        """
+        Write a run manifest so results are reproducible and citable: run date,
+        Entrez db/context, options, AI model, and any failed cells. Counts on
+        NCBI change daily, so an undated number is not citable.
+        """
+        ai_model = self.llm.get("model") if isinstance(self.llm, dict) else None
+        manifest = {
+            "tool": "MissMap",
+            "run_started": self.run_started,
+            "run_saved": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+            "entrez_db": "nuccore",
+            "entrez_email_set": bool(getattr(Entrez, "email", None)),
+            "entrez_api_key_set": bool(getattr(Entrez, "api_key", None)),
+            "request_delay_seconds": self.delay,
+            "species": self.species_list,
+            "datatypes": self.dt_list,
+            "filters": {dt: self.FILTERS[dt] for dt in self.dt_list},
+            "options": {
+                "exclude_infraspecific": self.exclude_infraspecific,
+                "ai_enabled": self.llm is not None,
+                "ai_unverified": self.ai_unverified,
+                "ai_validated_only": self.ai_validated_only,
+                "non_interactive": self.non_interactive,
+            },
+            "ai_model": ai_model,
+            "failed_cells": self._failed_cells,
+            "note": "Counts reflect NCBI nuccore on the run date and change daily.",
+        }
+        path = os.path.join(RESULTS_DIR, f"run_manifest_{ts}.json")
+        with open(path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Saved run manifest to {path}")
+        return path
+
+    @staticmethod
+    def _pick_excel_engine():
+        """Return an installed pandas Excel engine, or None if unavailable."""
+        for eng in ("xlsxwriter", "openpyxl"):
+            try:
+                __import__(eng)
+                return eng
+            except ImportError:
+                continue
+        return None
+
+    def _save_excel(self, df, ts):
+        """Save the matrix as .xlsx with auto-fit columns, engine-agnostic."""
+        engine = self._pick_excel_engine()
+        if engine is None:
+            print("[WARN] No Excel engine (xlsxwriter/openpyxl) installed; skipping .xlsx.")
+            return None
+        out_xlsx = os.path.join(RESULTS_DIR, f"data_availability_matrix_{ts}.xlsx")
+        try:
+            with pd.ExcelWriter(out_xlsx, engine=engine) as writer:
+                df.to_excel(writer, index=False, sheet_name="MissMap")
+                worksheet = writer.sheets["MissMap"]
+                for i, col in enumerate(df.columns):
+                    series = df[col].astype(str)
+                    width = min(max([len(str(col))] + [len(v) for v in series]) + 2, 120)
+                    if engine == "xlsxwriter":
+                        worksheet.set_column(i, i, width)
+                    else:  # openpyxl
+                        from openpyxl.utils import get_column_letter
+                        worksheet.column_dimensions[get_column_letter(i + 1)].width = width
+            print(f"Saved results to {out_xlsx}")
+            return out_xlsx
+        except Exception as e:
+            print(f"[WARN] Could not write Excel file: {e}")
+            return None
+
     def display_and_save_matrix(self):
         df = pd.DataFrame(self.rows)
         print("\n#==== GenBank data availability matrix ====#\n")
@@ -800,27 +1154,20 @@ class MissMap:
         else:
             print("[INFO] No rows to display.")
         print("\n#========================================#\n")
+
+        if self._failed_cells:
+            print(f"[WARN] {len(self._failed_cells)} query cell(s) failed and were "
+                  f"recorded as NA (not 0). See run manifest for the list.\n")
+
         ts = time.strftime("%Y%m%d-%H%M%S")
-        fn_csv = f"data_availability_matrix_{ts}.csv"
-        out_csv = os.path.join(RESULTS_DIR, fn_csv)
+        out_csv = os.path.join(RESULTS_DIR, f"data_availability_matrix_{ts}.csv")
         df.to_csv(out_csv, index=False)
         print(f"Saved results to {out_csv}")
 
-        # Also save Excel with auto-fit column widths
-        fn_xlsx = f"data_availability_matrix_{ts}.xlsx"
-        out_xlsx = os.path.join(RESULTS_DIR, fn_xlsx)
-        try:
-            with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="MissMap")
-                worksheet = writer.sheets["MissMap"]
-                for i, col in enumerate(df.columns):
-                    # set width based on max of header/data
-                    series = df[col].astype(str)
-                    max_len = max([len(str(col))] + [len(v) for v in series]) + 2
-                    worksheet.set_column(i, i, min(max_len, 120))
-            print(f"Saved results to {out_xlsx}")
-        except Exception as e:
-            print(f"[WARN] Could not write Excel file: {e}")
+        self._save_excel(df, ts)
+        self.save_coverage_summary(ts)
+        self.save_heatmap(ts)
+        self.save_manifest(ts)
 
 # ======================================================================
 # === Main execution ===================================================
@@ -842,10 +1189,11 @@ if __name__ == "__main__":
         ai_unverified=config.ai_unverified,
         verbose=config.verbose,
         debug_queries=config.debug_queries,
-        ai_validated_only=config.ai_validated_only
+        ai_validated_only=config.ai_validated_only,
+        non_interactive=config.non_interactive
     )
     if not config.no_ai:
-        program.init_ai_client(config.azure_config_file)
+        program.init_ai_client(config.config_file)
     else:
         print("[INFO] AI synonym enrichment disabled (--no-ai).")
 

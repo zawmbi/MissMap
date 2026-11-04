@@ -2,3 +2,15 @@ config.txt
 missmap_results/
 AI_prompt_isolated.py
 .env
+
+# secrets / local backups
+*.local-backup
+
+# python / os cruft
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+
+# local scratch scripts
+Joe'sTest.py
