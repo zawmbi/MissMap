@@ -1,5 +1,7 @@
 # MissMap.py
-# Integrated AI-based synonym enrichment in a single file (Groq version + optional subspecies exclusion)
+# NCBI sequence-data availability per species, with cross-authority synonym
+# reconciliation (WCVP / WFO / GBIF), hidden-record accounting, and optional
+# LLM synonym enrichment (any provider; see missmap_llm.py).
 
 import os                   # file handling
 import sys                  # error stuff
@@ -9,13 +11,19 @@ import pandas as pd         # dataframe for the output matrix
 from Bio import Entrez      # accessing NCBI Entrez API
 from urllib.error import HTTPError, URLError  # handles API request errors
 from xml.etree import ElementTree as ET  # parse XML from NCBI
-import requests             # Groq API calls
-import json                 # parse JSON from LLM
+import json                 # manifest + logs
 import re                   # infraspecific-rank detection
+from dataclasses import asdict
+
+from missmap_llm import make_provider, query_synonyms, synonym_names, LLMLog, PROMPT_VERSION
+from missmap_ncbi import parse_taxon_xml, choose_taxon, NcbiTaxdump, NcbiTaxon, EntrezCache
+from missmap_authorities import (load_wcvp, load_wfo, load_dwc, GBIFBackbone,
+                                 authority_synonyms, compare_synonymy)
+from missmap_classify import (classify_name, hidden_records_query, overcount_query,
+                              all_fields_query, BUCKETS)
 
 # ======================================================================
-#  MissMap: A pipeline for visualizing sequence data availability in
-#  plant clades with AI-driven synonym enrichment
+#  MissMap: how much NCBI sequence data does a name hide?
 # ======================================================================
 
 MISSMAP_INTRO = """
@@ -36,25 +44,37 @@ $ python MissMap.py -e yourncbiemail@address.com -k yourapikeylettersandnumbers 
 Manual entry without email and API key using config file (recommended): 
 $ python MissMap.py -s "species1" -dt "rbcL,matK,ITS" -c config.txt
 
-Storing email & API key and Groq settings in your environment (config.txt or .env):
+Storing email, API keys and the LLM choice (config.txt or .env):
 # email yourncbiemail@address.com
-# GROQ_API_KEY
-# GROQ_MODEL
+# LLM_MODEL anthropic:claude-sonnet-5-5     (or groq:llama-3.3-70b-versatile, ...)
+# GROQ_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY as needed
 
 You can also optionally set:
 # species Arabidopsis thaliana,Zea mays
 # datatypes chloroplast,mitochondrion,rbcL
 
-Optional flags:
+Authorities and reconciliation (strongly recommended):
+--wcvp PATH        WCVP names file (wcvp_names.csv or the release zip)
+--wfo PATH         WFO classification.csv (DwC) or its zip
+--dwc NAME=PATH    any other Darwin Core checklist (repeatable)
+--gbif             use the GBIF backbone API as an extra authority/name check
+--group NAME       expected lineage group for TaxID disambiguation (e.g. Viridiplantae)
+--taxdump DIR      use a local NCBI taxdump (names.dmp/nodes.dmp) instead of Entrez lookups
+
+Other flags:
+--llm SPEC        provider:model for synonym enrichment (overrides config)
 --verbose         Print per-datatype progress and count details.
---ai-unverified   Allow AI synonyms not validated in NCBI taxonomy.
+--ai-unverified   Search with every AI name, even ones no authority confirms.
 --debug-queries   Print exact NCBI query strings used for counts.
---ai-validated-only  Use only NCBI-validated AI synonyms in searches (strict).
+--ai-validated-only  Search only with AI names in the same TaxID or authority-confirmed.
 --no-subspecies   Exclude infraspecific/hybrid names from synonym search.
 --non-interactive Never prompt; fail if required inputs are missing (HPC/batch/CI).
+--no-cache        Do not reuse same-day Entrez answers (missmap_results/entrez_cache.sqlite).
 
 Outputs (in missmap_results/): matrix CSV/XLSX, presence/absence + count
-heatmaps (PNG), a coverage summary CSV, and a JSON run manifest.
+heatmaps (PNG, before and after synonym reconciliation), a coverage summary CSV,
+a per-name classification CSV, a Darwin Core crosswalk CSV, the LLM call log
+(JSONL), and a JSON run manifest.
 
 AI Disclaimer:
 AI output can vary by model and input context. Synonym lists may differ across runs,
@@ -98,7 +118,7 @@ def _is_retryable_error(err):
     return any(t in msg for t in transient_markers)
 
 # ======================================================================
-# === AI-BASED SYNONYM ENRICHMENT HELPERS (Groq) =======================
+# === Config + AI-based synonym enrichment helpers ====================
 # ======================================================================
 
 def load_dotenv(dotenv_path=".env"):
@@ -144,117 +164,43 @@ def read_config(fl):
     return data
 
 
-def get_llm_client(configfile):
+def get_llm_client(configfile, spec=None):
     """
-    Initialize and return a simple Groq config dict using config file or env vars.
-    We keep the name 'get_llm_client' so the rest of the code doesn't change.
+    Build the LLM provider used for synonym enrichment.
+
+    Resolution order for the model:
+      1. `spec` argument (from --llm), e.g. "anthropic:claude-sonnet-5-5"
+      2. LLM_MODEL in config.txt / .env / environment (same spec format)
+      3. legacy GROQ_MODEL (+ GROQ_API_KEY) -> "groq:<GROQ_MODEL>"
     """
     cfg = read_config(configfile)
-
-    api_key = cfg.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
-    model = cfg.get("GROQ_MODEL") or os.getenv("GROQ_MODEL") or ""
-
-    if not api_key:
-        raise KeyError(
-            "Missing GROQ_API_KEY. Set it in config.txt or as an environment variable."
-        )
-    if not model:
-        raise KeyError(
-            "Missing GROQ_MODEL. Set it in config.txt, .env, or as an environment variable."
-        )
-
-    return {
-        "api_key": api_key,
-        "model": model,
-    }
+    for k in ("GROQ_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+              "TOGETHER_API_KEY", "ANTHROPIC_API_KEY"):
+        if cfg.get(k) and not os.getenv(k):
+            os.environ[k] = cfg[k]
+    spec = spec or cfg.get("LLM_MODEL") or os.getenv("LLM_MODEL")
+    if not spec:
+        groq_model = cfg.get("GROQ_MODEL") or os.getenv("GROQ_MODEL")
+        if not groq_model:
+            raise KeyError("No LLM configured. Set LLM_MODEL (e.g. anthropic:claude-sonnet-5-5) "
+                           "or GROQ_MODEL + GROQ_API_KEY, or pass --llm.")
+        spec = f"groq:{groq_model}"
+    return make_provider(spec)
 
 
-# Template for enriching synonyms via AI (unchanged)
-AI_MAX_SYNONYMS = 200
-SYN_TEMPLATE = (
-    "You are a botanical taxonomy assistant. Given a species name and a list of known synonyms, "
-    "return a comprehensive list of additional genuine taxonomic synonyms (not subspecies or varieties), "
-    "plus well-established common names or spelling variants. Be exhaustive but limit to at most "
-    f"{AI_MAX_SYNONYMS} total items.\n"
-    "Do NOT include cultivars, processing terms, traits, or non-synonym species.\n"
-    "Input JSON: {{\"species\": \"{species}\", \"known_synonyms\": {known}}}\n"
-    "Output JSON schema:\n"
-    "{{\"synonyms\": [\"syn1\", \"syn2\", ...]}}\n"
-    "If none, return {{\"synonyms\": []}}.\n"
-    "Respond with JSON ONLY, no extra text."
-)
-
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-
-def run_template_query(llm, species, known_list):
+def lookup_synonyms_with_ai(species, manual_list, llm, log=None, run_index=0):
     """
-    Call the Groq chat API using SYN_TEMPLATE.
-    llm is a dict: {'api_key': ..., 'model': ...}
+    Ask the LLM for synonyms. Returns (scientific_synonyms, record) where
+    record is the logged call (raw text, model ID, errors) for the manifest.
+    A failed call returns ([], record-with-error) -- it is never silently
+    read as "the model knows no synonyms".
     """
-    system_prompt = SYN_TEMPLATE.format(species=species, known=known_list)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": ""},  # mirrors the previous empty HumanMessage
-    ]
-
-    payload = {
-        "model": llm["model"],
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": 1500,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {llm['api_key']}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-    except Exception as e:
-        print(f"[WARN] Groq request failed for '{species}': {e}")
-        return {"synonyms": []}
-
-    if resp.status_code != 200:
-        print(f"[WARN] Groq API error for '{species}': {resp.status_code}")
-        try:
-            print("[DEBUG]", resp.text[:500])
-        except Exception:
-            pass
-        return {"synonyms": []}
-
-    try:
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[WARN] Unexpected Groq response format for '{species}': {e}")
-        return {"synonyms": []}
-
-    # Content should be raw JSON because of SYN_TEMPLATE.
-    try:
-        parsed = json.loads(content)
-    except Exception as e:
-        print(f"[WARN] Failed to parse AI synonym JSON for '{species}': {e}")
-        print(f"[DEBUG] Raw AI response: {content}")
-        return {"synonyms": []}
-
-    return parsed  # expect {'synonyms': [...]}
-
-
-def lookup_synonyms_with_ai(species, manual_list, llm):
-    """Return AI-enriched synonyms by merging manual list and LLM output."""
     if not llm:
-        return []
-    known = manual_list or []
-    try:
-        result = run_template_query(llm, species, known)
-        extra = result.get("synonyms", [])
-        return [s.strip() for s in extra if isinstance(s, str) and s.strip()]
-    except Exception as e:
-        print(f"[WARN] AI synonym lookup failed for '{species}': {e}")
-        return []
+        return [], None
+    rec = query_synonyms(llm, species, known=manual_list or None, run_index=run_index, log=log)
+    if rec.get("error"):
+        print(f"[WARN] AI synonym lookup failed for '{species}': {rec['error']}")
+    return synonym_names(rec), rec
 
 # ======================================================================
 # === Configuration class ==============================================
@@ -275,6 +221,16 @@ class Configuration:
         # Non-interactive: never block on input() (for HPC/batch/CI). Auto-on
         # when stdin is not a TTY; can also be forced with --non-interactive.
         self.non_interactive   = not sys.stdin.isatty()
+        # Authorities / reconciliation
+        self.wcvp_path         = None
+        self.wfo_path          = None
+        self.dwc_paths         = {}           # {name: path}
+        self.use_gbif          = False
+        self.group             = None         # expected lineage group, e.g. Viridiplantae
+        self.taxdump_dir       = None
+        self.llm_spec          = None
+        self.use_cache         = True
+        self.cache_hours       = 24.0
 
     def load_config(self):
         """Load email, api_key, species, and datatypes from config file."""
@@ -300,11 +256,19 @@ class Configuration:
                         self.species = [s.strip() for s in val.split(",") if s.strip()]
                     elif key in ("datatypes", "data_types"):
                         self.data_types = [d.strip() for d in val.split(",") if d.strip()]
+                    elif key == "wcvp":
+                        self.wcvp_path = val.strip()
+                    elif key == "wfo":
+                        self.wfo_path = val.strip()
+                    elif key == "group":
+                        self.group = val.strip()
+                    elif key == "taxdump":
+                        self.taxdump_dir = val.strip()
         except FileNotFoundError:
             # Config is optional; just skip if missing.
             pass
 
-    def terminal_inputs(self):
+    def terminal_inputs(self, argv=None):
         parser = argparse.ArgumentParser(
             prog="MissMap",
             description="GenBank data availability visualizer."
@@ -331,7 +295,21 @@ class Configuration:
                             help="Use only NCBI-validated AI synonyms in searches (strict mode).")
         parser.add_argument("--non-interactive", action="store_true",
                             help="Never prompt; fail if required inputs are missing (HPC/batch/CI).")
-        args = parser.parse_args()
+        parser.add_argument("--wcvp", help="Path to the WCVP names file (or release zip).")
+        parser.add_argument("--wfo", help="Path to WFO classification.csv (or zip).")
+        parser.add_argument("--dwc", action="append", default=[], metavar="NAME=PATH",
+                            help="Extra Darwin Core checklist, e.g. MDD=mdd_taxon.tsv (repeatable).")
+        parser.add_argument("--gbif", action="store_true",
+                            help="Use the GBIF backbone API as an extra name check.")
+        parser.add_argument("--group",
+                            help="Expected lineage group for TaxID disambiguation (e.g. Viridiplantae, Mammalia).")
+        parser.add_argument("--taxdump", help="Directory with NCBI names.dmp + nodes.dmp.")
+        parser.add_argument("--llm", help="LLM spec provider:model, e.g. anthropic:claude-sonnet-5-5.")
+        parser.add_argument("--no-cache", action="store_true",
+                            help="Do not reuse cached Entrez answers.")
+        parser.add_argument("--cache-hours", type=float, default=24.0,
+                            help="Reuse cached Entrez answers younger than this (default 24; 0 = never expire).")
+        args = parser.parse_args(argv)
 
         # Optional override of config file
         if args.configfile:
@@ -379,6 +357,19 @@ class Configuration:
         self.verbose = args.verbose
         self.debug_queries = args.debug_queries
         self.ai_validated_only = args.ai_validated_only
+        self.wcvp_path = args.wcvp or self.wcvp_path
+        self.wfo_path = args.wfo or self.wfo_path
+        for item in args.dwc:
+            if "=" not in item:
+                parser.error(f"--dwc expects NAME=PATH, got '{item}'")
+            n, pth = item.split("=", 1)
+            self.dwc_paths[n.strip()] = pth.strip()
+        self.use_gbif = args.gbif
+        self.group = args.group or self.group
+        self.taxdump_dir = args.taxdump or self.taxdump_dir
+        self.llm_spec = args.llm
+        self.use_cache = not args.no_cache
+        self.cache_hours = None if args.cache_hours == 0 else args.cache_hours
 
         # Configure Entrez
         if self.email:
@@ -418,41 +409,59 @@ class MissMap:
     }
 
     def __init__(self, exclude_infraspecific=False, ai_unverified=False, verbose=False,
-                 debug_queries=False, ai_validated_only=False, non_interactive=False):
+                 debug_queries=False, ai_validated_only=False, non_interactive=False,
+                 checklists=None, gbif=None, group=None, taxdump=None, cache=None):
         os.makedirs(RESULTS_DIR, exist_ok=True)
         self.species_list = []
         self.dt_list      = []
         self.rows         = []
-        self.llm          = None  # will be set by init_ai_client
+        self.llm          = None  # provider object, set by init_ai_client
+        self.llm_log      = None
         self.exclude_infraspecific = exclude_infraspecific
         self.ai_unverified = ai_unverified
         self.verbose = verbose
         self.debug_queries = debug_queries
         self.ai_validated_only = ai_validated_only
         self.non_interactive = non_interactive
-        self._tax_name_cache = {}  # cache taxonomy lookups by name
+        self.checklists = list(checklists or [])   # Checklist objects (WCVP, WFO, ...)
+        self.gbif = gbif                            # GBIFBackbone or None
+        self.group = group                          # e.g. "Viridiplantae"
+        self.taxdump = taxdump                      # NcbiTaxdump or None
+        self.cache = cache                          # EntrezCache or None
+        self._tax_name_cache = {}  # name -> [NcbiTaxon]
+        self._taxon_info = {}      # species -> {"flags": [...], "taxon": NcbiTaxon}
 
         # Reliability / reproducibility bookkeeping.
         self._failed_cells = []     # list of (species, datatype) that returned NA
         self._matrix_records = []   # numeric per-species rows for the heatmap
+        self._name_rows = []        # one row per (species, candidate name) classification
+        self._comparisons = []      # per-species cross-authority synonymy comparison
+        self._llm_records = []      # logged LLM calls used in this run
         self.run_started = time.strftime("%Y-%m-%d %H:%M:%S %z")
 
         # Be a bit more conservative if no API key is set.
         self.delay = 0.12 if getattr(Entrez, "api_key", None) else 0.4
 
-    def init_ai_client(self, config_file):
-        """Initialize Groq LLM config for synonym enrichment (reusing config file path)."""
+    def init_ai_client(self, config_file, spec=None):
+        """Initialize the LLM provider for synonym enrichment (any provider; see missmap_llm)."""
         try:
-            self.llm = get_llm_client(config_file)
-            print("[INFO] Groq client config initialized for synonym enrichment.")
+            self.llm = get_llm_client(config_file, spec)
+            self.llm_log = LLMLog(os.path.join(RESULTS_DIR, "llm_calls.jsonl"))
+            print(f"[INFO] LLM for synonym enrichment: {self.llm.name}:{self.llm.model} "
+                  f"(prompt {PROMPT_VERSION}).")
         except Exception as e:
-            print(f"[WARN] Could not initialize Groq client: {e}")
+            print(f"[WARN] Could not initialize LLM client: {e}")
             print("[WARN] Continuing without AI-based synonym enrichment.")
             self.llm = None
 
     def lookup_synonyms_with_ai(self, species, manual_list):
-        """Return extra synonyms using the LLM."""
-        return lookup_synonyms_with_ai(species, manual_list, self.llm)
+        """Return scientific synonyms proposed by the LLM (call is logged)."""
+        names, rec = lookup_synonyms_with_ai(species, manual_list, self.llm, log=self.llm_log)
+        if rec is not None:
+            self._llm_records.append({k: rec.get(k) for k in
+                                      ("provider", "model", "mode", "species", "run_index",
+                                       "prompt_version", "timestamp", "error")})
+        return names
 
     def ask_species(self):
         if self.non_interactive:
@@ -518,6 +527,10 @@ class MissMap:
             backoff, honouring NCBI's rate limits;
           * sleeps self.delay after a *successful* call to pace requests.
         """
+        if self.cache is not None:
+            hit = self.cache.get("nuccore_count", term)
+            if hit is not None:
+                return int(hit)
         last_err = None
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -529,7 +542,10 @@ class MissMap:
                 if "Count" not in rec:
                     raise ValueError("Entrez response missing 'Count' field")
                 time.sleep(self.delay)  # pace only after a real success
-                return int(rec["Count"])
+                count = int(rec["Count"])
+                if self.cache is not None:
+                    self.cache.set("nuccore_count", term, count)  # only successes are cached
+                return count
             except Exception as e:  # noqa: BLE001 - we re-raise/inspect below
                 last_err = e
                 if attempt < MAX_RETRIES and _is_retryable_error(e):
@@ -549,49 +565,115 @@ class MissMap:
         self._failed_cells.append(context or term)
         return COUNT_NA
 
+    # ------------------------------------------------------------------
+    # NCBI Taxonomy lookups
+    # ------------------------------------------------------------------
+    def _entrez_retry(self, func, context, **kwargs):
+        """Call an Entrez function with the same retry/backoff policy as counts."""
+        last_err = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with func(**kwargs) as h:
+                    data = h.read() if func is Entrez.efetch else Entrez.read(h)
+                time.sleep(self.delay)
+                return data
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < MAX_RETRIES and _is_retryable_error(e):
+                    time.sleep(BACKOFF_BASE * (2 ** attempt))
+                    continue
+                break
+        self.handle_errors(f"{context}: {last_err}")
+        return None
+
+    def _ncbi_candidates(self, name, filter_group=True):
+        """
+        Every NCBI taxon the name resolves to (as scientific name, synonym,
+        equivalent name, ...). Filtered to the expected lineage group if set.
+        """
+        key = name.strip().lower()
+        if not key:
+            return []
+        if key not in self._tax_name_cache:
+            cands = None
+            if self.taxdump is not None:
+                cands = self.taxdump.candidates(name)
+            else:
+                cached = self.cache.get("taxonomy_candidates", key) if self.cache else None
+                if cached is not None:
+                    cands = [NcbiTaxon(**c) for c in cached]
+                else:
+                    res = self._entrez_retry(Entrez.esearch, f"taxonomy search '{name}'",
+                                             db="taxonomy", term=f"\"{name}\"[All Names]", retmax=50)
+                    if res is None:
+                        cands = None   # lookup failed: do not cache as 'not found'
+                    else:
+                        ids = res.get("IdList", []) or []
+                        cands = []
+                        if ids:
+                            xml = self._entrez_retry(Entrez.efetch, f"taxonomy fetch '{name}'",
+                                                     db="taxonomy", id=",".join(ids), retmode="xml")
+                            cands = parse_taxon_xml(xml) if xml else None
+                        if cands is not None and self.cache is not None:
+                            self.cache.set("taxonomy_candidates", key, [asdict(c) for c in cands])
+            if cands is None:
+                return []
+            self._tax_name_cache[key] = cands
+        cands = self._tax_name_cache[key]
+        if filter_group and self.group:
+            cands = [c for c in cands if c.in_group(self.group)]
+        return cands
+
     def lookup_synonyms_manually(self, taxon):
-        syns = []
-        taxid = None
-        try:
-            # taxonomy search by scientific name
-            with Entrez.esearch(
-                db="taxonomy",
-                term=f"{taxon.lower()}[Scientific Name]"
-            ) as q:
-                res = Entrez.read(q)
-            ids = res.get("IdList", [])
+        """
+        Resolve the species to ONE NCBI TaxID (rank- and lineage-checked) and
+        return (scientific synonyms, taxid). Ambiguous names return taxid None
+        with flags explaining why, instead of silently taking the first hit.
+        """
+        cands = self._ncbi_candidates(taxon, filter_group=False)
+        chosen, flags = choose_taxon(taxon, cands, expected_group=self.group)
+        info = {"flags": flags, "taxon": chosen,
+                "candidates": [f"{c.taxid}:{c.scientific_name}:{c.rank}" for c in cands]}
+        self._taxon_info[taxon] = info
+        if chosen is None:
+            if "ambiguous" in flags or "not_in_expected_group" in flags:
+                print(f"[WARN] '{taxon}': TaxID not resolved ({', '.join(flags)}). "
+                      f"Candidates: {'; '.join(info['candidates']) or 'none'}")
+            return [], None
+        if flags and self.verbose:
+            print(f"[INFO] '{taxon}': TaxID {chosen.taxid} ({', '.join(flags)})")
+        return list(chosen.synonyms), chosen.taxid
 
-            # fallback: all names
-            if not ids:
-                with Entrez.esearch(
-                    db="taxonomy",
-                    term=f"{taxon.lower()}[All Names]"
-                ) as q:
-                    res = Entrez.read(q)
-                ids = res.get("IdList", [])
-
-            if not ids:
-                return syns, taxid  # no synonyms, no taxid
-
-            # Take the first taxonomy ID (could refine later if needed)
-            taxid = ids[0]
-
-            with Entrez.efetch(db="taxonomy", id=taxid, retmode="xml") as q:
-                xml = q.read()
-
-            root = ET.fromstring(xml)
-            for e in root.findall(".//OtherNames/Synonym"):
-                if e.text:
-                    syns.append(e.text.strip())
-            for e in root.findall(".//OtherNames/GenbankCommonName"):
-                if e.text:
-                    txt = e.text.strip()
-                    if txt and txt not in syns:
-                        syns.append(txt)
-        except Exception as e:
-            self.handle_errors(e)
-        return syns, taxid
-
+    def _descendant_taxa(self, taxid):
+        """Taxa below `taxid` (subspecies, varieties, ...) -- already in [Organism:exp]."""
+        if not taxid:
+            return []
+        if self.taxdump is not None:
+            out, stack = [], [str(taxid)]
+            while stack:
+                for ch in self.taxdump.children(stack.pop()):
+                    t = self.taxdump.taxon(ch)
+                    if t:
+                        out.append(t)
+                        stack.append(ch)
+            return out
+        key = str(taxid)
+        cached = self.cache.get("taxonomy_subtree", key) if self.cache else None
+        if cached is not None:
+            return [NcbiTaxon(**c) for c in cached]
+        res = self._entrez_retry(Entrez.esearch, f"subtree txid{taxid}",
+                                 db="taxonomy", term=f"txid{taxid}[Subtree]", retmax=500)
+        if res is None:
+            return []
+        ids = [i for i in (res.get("IdList", []) or []) if str(i) != key]
+        out = []
+        if ids:
+            xml = self._entrez_retry(Entrez.efetch, f"subtree fetch txid{taxid}",
+                                     db="taxonomy", id=",".join(ids), retmode="xml")
+            out = parse_taxon_xml(xml) if xml else []
+        if self.cache is not None:
+            self.cache.set("taxonomy_subtree", key, [asdict(c) for c in out])
+        return out
 
     # Infraspecific / hybrid rank connectors. Matched as whole tokens so we
     # catch 'var.', 'subsp.', 'ssp.', 'f.', 'forma', 'nothosubsp.', 'subvar.'
@@ -628,75 +710,130 @@ class MissMap:
         return filtered
 
     def _taxonomy_name_search(self, name):
-        """Return taxonomy ID list for a given name using NCBI taxonomy search."""
-        key = name.strip().lower()
-        if not key:
-            return []
-        if key in self._tax_name_cache:
-            return self._tax_name_cache[key]
+        """Return the in-group NCBI TaxIDs a name resolves to."""
+        return [c.taxid for c in self._ncbi_candidates(name)]
 
-        ids = []
-        try:
-            with Entrez.esearch(
-                db="taxonomy",
-                term=f"\"{name}\"[All Names]"
-            ) as q:
-                res = Entrez.read(q)
-            ids = res.get("IdList", []) or []
-        except Exception as e:
-            self.handle_errors(e)
-            ids = []
+    def _classify(self, species, taxid, names, descendants, source):
+        """Classify candidate names; returns {name: info}. See missmap_classify.BUCKETS."""
+        out = {}
+        name_exists = self.gbif.name_exists if self.gbif is not None else None
+        desc_ids = {d.taxid for d in descendants}
+        for n in names:
+            n = (n or "").strip()
+            if not n or n.lower() == species.lower():
+                continue
+            info = classify_name(n, species, taxid, self._ncbi_candidates(n), self.checklists,
+                                 name_exists=name_exists, descendant_taxids=desc_ids)
+            info["source"] = source
+            out[n] = info
+        return out
 
-        self._tax_name_cache[key] = ids
-        time.sleep(self.delay)
-        return ids
-
-    def _validate_ai_synonyms(self, species, taxid, ai_synonyms):
+    def _validate_ai_synonyms(self, species, taxid, ai_synonyms, descendants=()):
         """
-        Keep only AI synonyms that resolve to the SAME NCBI TaxID.
-        This ensures synonym accuracy using NCBI as the source of truth.
+        AI names usable for searching. A name qualifies if NCBI already files
+        it under this TaxID, or if NCBI files it under ANOTHER TaxID and an
+        authority confirms it as a synonym (that second group is where hidden
+        records are). With --ai-unverified every scientific name qualifies.
         """
         if not ai_synonyms:
             return []
         if self.ai_unverified:
-            # Permissive mode: accept AI synonyms even if not present in NCBI taxonomy.
             return [n.strip() for n in ai_synonyms if isinstance(n, str) and n.strip()]
         if not taxid:
-            print(
-                f"[WARN] No TaxID for '{species}'; skipping AI synonyms to preserve accuracy."
-            )
+            print(f"[WARN] No TaxID for '{species}'; skipping AI synonyms to preserve accuracy.")
             return []
+        cls = self._classify(species, taxid, ai_synonyms, descendants, "AI")
+        return [n for n, i in cls.items() if i["bucket"] in ("same_taxid", "other_taxid_confirmed")]
 
-        validated = []
-        for name in ai_synonyms:
-            if not isinstance(name, str):
-                continue
-            n = name.strip()
-            if not n:
-                continue
-            if n.lower() == species.lower():
-                continue
-            ids = self._taxonomy_name_search(n)
-            if taxid in ids:
-                validated.append(n)
-        return validated
-
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
     def data_counts(self):
         """
-        Query NCBI for each species × datatype, using TaxID when available, and collect counts.
-        Also compare name-based search counts using NCBI taxonomy synonyms vs NCBI+AI synonyms.
+        Per species:
+          1. resolve one TaxID (rank/lineage checked) and NCBI's synonyms;
+          2. collect each authority's synonymy and compare (Aim 1);
+          3. ask the LLM, classify every AI and authority name (Aim 3);
+          4. count records per datatype on the TaxID (primary), plus hidden
+             records under other TaxIDs that authorities call synonyms, plus
+             free-text over-counts (Aim 2).
         """
         for species in self.species_list:
             row = {"Species": species}
 
-            # 1) Get manual synonyms + TaxID from taxonomy
+            # 1) TaxID + NCBI synonyms
             manual, taxid = self.lookup_synonyms_manually(species)
+            tinfo = self._taxon_info.get(species, {})
+            taxon = tinfo.get("taxon")
+            row["TaxID"] = taxid if taxid else NA_LABEL
+            row["TaxID Flags"] = ",".join(tinfo.get("flags", []))
+            row["NCBI Common Names"] = ",".join(taxon.common_names) if taxon else ""
 
-            # 2) AI enrichment (uses manual list only), then validate against NCBI TaxID (labeling only)
+            # 2) Authorities
+            auth_syns = {}
+            if self.checklists:
+                cmp_ = compare_synonymy(species, self.checklists, ncbi_synonyms=manual,
+                                        include_infraspecific=not self.exclude_infraspecific)
+                self._comparisons.append(cmp_)
+                for cl in self.checklists:
+                    row[f"{cl.name} Accepted Name"] = "; ".join(cmp_["accepted"].get(cl.name, []))
+                    row[f"{cl.name} Synonyms"] = ",".join(cmp_["synonyms"].get(cl.name, []))
+                row["Accepted Name Agrees Across Authorities"] = str(cmp_["accepted_agree"])
+                auth_syns = authority_synonyms(species, self.checklists,
+                                               include_infraspecific=not self.exclude_infraspecific)
+            if self.gbif is not None:
+                try:
+                    _acc, gsyns = self.gbif.synonym_names(species)
+                    for n in gsyns:
+                        if self.exclude_infraspecific and self._is_infraspecific(n):
+                            continue
+                        auth_syns.setdefault(n, []).append("GBIF")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[WARN] GBIF lookup failed for '{species}': {e}")
+            ncbi_syn_keys = {s.lower() for s in manual}
+            row["Authority Synonyms Missing From NCBI"] = ",".join(
+                sorted(n for n in auth_syns if n.lower() not in ncbi_syn_keys))
+
+            # 3) AI enrichment + classification of every candidate name
             ai_extra_raw = self.lookup_synonyms_with_ai(species, manual)
             ai_proposed = [s.strip() for s in (ai_extra_raw or []) if isinstance(s, str) and s.strip()]
-            ai_validated = self._validate_ai_synonyms(species, taxid, ai_proposed)
+            descendants = self._descendant_taxa(taxid) if (taxid and (ai_proposed or auth_syns)) else []
+            ai_cls = self._classify(species, taxid, ai_proposed, descendants, "AI") if taxid else {}
+            auth_cls = self._classify(species, taxid, list(auth_syns), descendants, "authority") if taxid else {}
+            # A name that any authority source (incl. GBIF, which is not a loaded
+            # checklist) lists as a synonym of this species is confirmed by it.
+            for cls_ in (ai_cls, auth_cls):
+                for n, i in cls_.items():
+                    srcs = auth_syns.get(n)
+                    if not srcs:
+                        continue
+                    i["confirmed_by"] = srcs
+                    if i["bucket"] == "other_taxid_unconfirmed":
+                        i["bucket"] = "other_taxid_confirmed"
+                    elif i["bucket"] == "not_found":
+                        i["bucket"] = "valid_not_in_ncbi"
+            for n, i in list(ai_cls.items()) + list(auth_cls.items()):
+                self._name_rows.append({
+                    "Species": species, "TaxID": taxid, "Name": n, "Source": i["source"],
+                    "Authority Sources": ",".join(auth_syns.get(n, [])),
+                    "Bucket": i["bucket"], "NCBI TaxIDs": ",".join(i.get("ncbi_taxids", [])),
+                    "Hidden TaxIDs": ",".join(i.get("hidden_taxids", [])),
+                    "Authority Verdicts": json.dumps(i.get("authority", {}), sort_keys=True),
+                    "GBIF Exact Match": i.get("gbif_exists", ""),
+                })
+
+            if self.ai_unverified:
+                ai_validated = [n for n in ai_proposed if n.lower() != species.lower()]
+            elif not taxid:
+                if ai_proposed:
+                    print(f"[WARN] No TaxID for '{species}'; skipping AI synonyms to preserve accuracy.")
+                ai_validated = []
+            else:
+                ai_validated = [n for n, i in ai_cls.items()
+                                if i["bucket"] in ("same_taxid", "other_taxid_confirmed")]
             ai_rejected = [s for s in ai_proposed if s not in ai_validated]
+            for b in BUCKETS:
+                row[f"AI: {b}"] = ",".join(n for n, i in ai_cls.items() if i["bucket"] == b)
 
             # include the original species name in the sets
             base_names = [species] + (manual or [])
@@ -721,10 +858,22 @@ class MissMap:
             row["AI Proposed Synonyms"] = ",".join(ai_proposed)
             row["AI-validated Synonyms"] = ",".join(syn_only_ai)
             row["AI Rejected Synonyms"] = ",".join(ai_rejected)
-            row["AI Validation Source"] = "NCBI Taxonomy"
+            row["AI Validation Source"] = "NCBI Taxonomy" + "".join(
+                f" + {cl.name}" for cl in self.checklists) + (" + GBIF" if self.gbif else "")
             row["synonyms"] = ",".join(syn_only_all)
 
-            # 3) Decide whether to use TaxID or fall back to name-based search
+            # Hidden TaxIDs: names filed under OTHER TaxIDs that authorities call synonyms.
+            hidden_auth = sorted({t for i in auth_cls.values() if i["bucket"] == "other_taxid_confirmed"
+                                  for t in i.get("hidden_taxids", [])})
+            ai_hidden_buckets = {"other_taxid_confirmed"} | (
+                {"other_taxid_unconfirmed"} if self.ai_unverified else set())
+            hidden_ai = sorted({t for i in ai_cls.values() if i["bucket"] in ai_hidden_buckets
+                                for t in i.get("hidden_taxids", [])})
+            hidden_all = sorted(set(hidden_auth) | set(hidden_ai))
+            row["Hidden TaxIDs (authority synonyms)"] = ",".join(hidden_auth)
+            row["Hidden TaxIDs (AI synonyms)"] = ",".join(hidden_ai)
+
+            # 4) Decide whether to use TaxID or fall back to name-based search
             use_taxid = taxid is not None
 
             # Name-based queries for comparison (NCBI synonyms vs NCBI+AI synonyms)
@@ -743,6 +892,7 @@ class MissMap:
             )
             row["NCBI Query (no filters, NCBI synonyms)"] = organism_query_base
             row["NCBI Query (no filters, NCBI+AI)"] = organism_query_expanded
+            row["NCBI Query (hidden records)"] = hidden_records_query(hidden_all, taxid) if use_taxid else ""
 
             # Name-based fallback query if TaxID is missing (used for main counts)
             organism_query = organism_query_expanded
@@ -750,10 +900,12 @@ class MissMap:
             # numeric_counts holds the authoritative (TaxID-based when available)
             # per-datatype count for this species: int, or COUNT_NA on failure.
             numeric_counts = {}
+            reconciled_counts = {}
+            gained = []
             name_based_total_base = 0
             name_based_total_expanded = 0
 
-            # 4) For each datatype, search nuccore
+            # 5) For each datatype, search nuccore
             for dt in self.dt_list:
                 if self.verbose:
                     print(f"[INFO] {species} | {dt} | running search...")
@@ -771,6 +923,21 @@ class MissMap:
                 row[dt] = self._fmt(count)
                 if self.verbose:
                     print(f"[INFO] {species} | {dt} | TaxID/primary count: {self._fmt(count)}")
+
+                # Hidden records for this datatype (only when hidden TaxIDs exist).
+                if use_taxid and hidden_all:
+                    hq = hidden_records_query(hidden_all, taxid, self.FILTERS[dt])
+                    if self.debug_queries:
+                        print(f"[QUERY] {species} | {dt} | hidden: {hq}")
+                    hidden_dt = self._esearch_count(hq, context=f"{species} | {dt} | hidden")
+                    if count is COUNT_NA or hidden_dt is COUNT_NA:
+                        reconciled_counts[dt] = COUNT_NA
+                    else:
+                        reconciled_counts[dt] = count + hidden_dt
+                        if count == 0 and hidden_dt > 0:
+                            gained.append(f"{dt}(+{hidden_dt})")
+                else:
+                    reconciled_counts[dt] = count
 
                 # Name-based comparison counts (NCBI synonyms vs NCBI+AI).
                 # NA cells are skipped from the running totals rather than
@@ -800,7 +967,7 @@ class MissMap:
                         f"[QUERY] {species} | {dt} | name-based NCBI+AI: {organism_query_expanded} AND {self.FILTERS[dt]}"
                     )
 
-            # 5) Aggregate across datatypes.
+            # 6) Aggregate across datatypes.
             #    The SUM double-counts: one record (e.g. a chloroplast genome)
             #    matches chloroplast, WGS, rbcL, matK, ycf1, ndhF at once. It is
             #    reported only as an overlapping tally, never as a record count.
@@ -808,7 +975,7 @@ class MissMap:
             na_cells = sum(1 for c in numeric_counts.values() if c is COUNT_NA)
             sum_overlapping = sum(valid_counts)
 
-            # 5b) DEDUPLICATED UNION: records matching AT LEAST ONE selected
+            # 6b) DEDUPLICATED UNION: records matching AT LEAST ONE selected
             #     filter. OR-combining inside a single query lets NCBI dedupe,
             #     giving a true record count (always <= Total NCBI no-filters).
             filter_union = " OR ".join(f"({self.FILTERS[dt]})" for dt in self.dt_list)
@@ -829,7 +996,7 @@ class MissMap:
                 name_based_total_expanded - name_based_total_base
             )
 
-            # 6) Total NCBI (no filters)
+            # 7) Total NCBI (no filters)
             if use_taxid:
                 base_term = f"txid{taxid}[Organism:exp]"
             else:
@@ -847,30 +1014,67 @@ class MissMap:
                     f"total ({total_all}); check filter/scoping consistency."
                 )
 
-            # Name-based unfiltered comparison (NCBI synonyms vs NCBI+AI)
-            total_all_base = self._esearch_count(
-                organism_query_base, context=f"{species} | no-filter name-based NCBI"
-            )
-            total_all_expanded = self._esearch_count(
-                organism_query_expanded, context=f"{species} | no-filter name-based NCBI+AI"
-            )
-            row["Name-based NCBI (no filters)"] = self._fmt(total_all_base)
-            row["Name-based NCBI+AI (no filters)"] = self._fmt(total_all_expanded)
-            if isinstance(total_all_base, int) and isinstance(total_all_expanded, int):
-                row["Name-based Gain (no filters)"] = str(total_all_expanded - total_all_base)
+            # 8) Hidden records (recall loss) and free-text over-count (precision loss).
+            def _count_or_zero(names_taxids, ctx):
+                if not use_taxid:
+                    return COUNT_NA      # no TaxID -> hidden records are not measurable
+                if not names_taxids:
+                    return 0
+                return self._esearch_count(hidden_records_query(names_taxids, taxid), context=ctx)
+
+            hidden_auth_n = _count_or_zero(hidden_auth, f"{species} | hidden (authority)")
+            hidden_ai_n = _count_or_zero(hidden_ai, f"{species} | hidden (AI)")
+            hidden_all_n = _count_or_zero(hidden_all, f"{species} | hidden (all)")
+            row["Hidden Records (authority synonyms)"] = self._fmt(hidden_auth_n)
+            row["Hidden Records (AI synonyms)"] = self._fmt(hidden_ai_n)
+            row["Hidden Records (all)"] = self._fmt(hidden_all_n)
+            if isinstance(total_all, int) and isinstance(hidden_all_n, int) and (total_all + hidden_all_n) > 0:
+                row["Hidden Share of Reconciled Total (%)"] = (
+                    f"{100.0 * hidden_all_n / (total_all + hidden_all_n):.3g}")
             else:
-                row["Name-based Gain (no filters)"] = NA_LABEL
-            if self.debug_queries:
-                print(f"[QUERY] {species} | no-filter name-based NCBI: {organism_query_base}")
-                print(f"[QUERY] {species} | no-filter name-based NCBI+AI: {organism_query_expanded}")
+                row["Hidden Share of Reconciled Total (%)"] = NA_LABEL
+            row["Markers Gained via Synonyms"] = ",".join(gained)
+
+            if use_taxid:
+                af = self._esearch_count(all_fields_query(species), context=f"{species} | all-fields")
+                oc = self._esearch_count(overcount_query(species, taxid), context=f"{species} | over-count")
+                noexp = self._esearch_count(f"txid{taxid}[Organism:noexp]", context=f"{species} | noexp")
+                row["Free-text Name Search (All Fields)"] = self._fmt(af)
+                row["Free-text Hits Not Under TaxID (over-count)"] = self._fmt(oc)
+                row["TaxID Records Excl. Infraspecific (noexp)"] = self._fmt(noexp)
+                if isinstance(af, int) and isinstance(oc, int) and af > 0:
+                    row["Free-text Precision (%)"] = str(round(100.0 * (af - oc) / af, 2))
+                else:
+                    row["Free-text Precision (%)"] = NA_LABEL
+
+            # 9) Lumping: names NCBI includes under this TaxID that an authority
+            #    treats as separate species (records wrongly included).
+            if use_taxid and self.checklists:
+                from missmap_classify import authority_verdict, taxid_union
+                lumped_syn = [n for n in manual
+                              if "different_taxon" in authority_verdict(n, species, self.checklists).values()]
+                lumped_children = [d for d in descendants
+                                   if "different_taxon" in authority_verdict(
+                                       d.scientific_name, species, self.checklists).values()]
+                row["NCBI Synonyms Authorities Treat As Separate Species"] = ",".join(lumped_syn)
+                row["NCBI Child Taxa Authorities Treat As Separate Species"] = ",".join(
+                    f"{d.scientific_name} ({d.taxid})" for d in lumped_children)
+                if lumped_children:
+                    lc = self._esearch_count(taxid_union([d.taxid for d in lumped_children]),
+                                             context=f"{species} | lumped children")
+                    row["Records Under Those Child Taxa"] = self._fmt(lc)
+                else:
+                    row["Records Under Those Child Taxa"] = "0"
 
             # Record-keeping for the heatmap / coverage summary.
             self._matrix_records.append({
                 "Species": species,
                 "taxid": taxid,
                 "counts": dict(numeric_counts),
+                "counts_reconciled": dict(reconciled_counts),
                 "union": union_count,
                 "total_all": total_all,
+                "hidden_all": hidden_all_n,
             })
 
             if na_cells:
@@ -891,7 +1095,6 @@ class MissMap:
 
             self.rows.append(row)
 
-
     # ------------------------------------------------------------------
     # Ordered columns: genomic categories first, then barcode markers,
     # preserving the user's dt_list order within each group.
@@ -901,7 +1104,7 @@ class MissMap:
         markers = [dt for dt in self.dt_list if dt not in self.GENOMIC_CATEGORIES]
         return genomic, markers
 
-    def save_heatmap(self, ts):
+    def save_heatmap(self, ts, key="counts", tag=""):
         """
         Render the species x datatype availability map(s) -- the "map" in
         MissMap. Produces two PNGs:
@@ -937,7 +1140,7 @@ class MissMap:
         counts = np.full((n_rows, n_cols), np.nan)
         for i, rec in enumerate(self._matrix_records):
             for j, dt in enumerate(cols):
-                c = rec["counts"].get(dt, COUNT_NA)
+                c = rec.get(key, rec["counts"]).get(dt, COUNT_NA)
                 counts[i, j] = np.nan if c is COUNT_NA else float(c)
 
         figw = max(6.0, 0.7 * n_cols + 3.0)
@@ -973,7 +1176,9 @@ class MissMap:
                     txt_color = "white" if (not np.isnan(c) and c > 0) else "#333333"
                     ax.text(j, i, label, ha="center", va="center",
                             fontsize=6.5, color=txt_color)
-        ax.set_title("MissMap: sequence data presence / absence", fontsize=11)
+        ax.set_title("MissMap: sequence data presence / absence"
+                     + (" (after synonym reconciliation)" if key == "counts_reconciled" else ""),
+                     fontsize=11)
         legend = [
             Patch(facecolor="#2c7fb8", label="present (>=1 record)"),
             Patch(facecolor="#eef1f5", label="absent (0 records)"),
@@ -985,11 +1190,13 @@ class MissMap:
             ax.text(0, 1.02, "genomic <-", transform=ax.transAxes, fontsize=7, color="#555")
             ax.text(1.0, 1.02, "-> markers", transform=ax.transAxes, fontsize=7,
                     color="#555", ha="right")
-        path1 = os.path.join(RESULTS_DIR, f"missmap_presence_{ts}.png")
+        path1 = os.path.join(RESULTS_DIR, f"missmap_presence{tag}_{ts}.png")
         fig.savefig(path1, dpi=150, bbox_inches="tight")
         plt.close(fig)
         saved.append(path1)
         print(f"Saved presence/absence map to {path1}")
+        if key == "counts_reconciled":
+            return saved  # only the presence map is drawn for the reconciled view
 
         # ---- Figure 2: log10(count+1) magnitude ------------------------------
         log_counts = np.log10(counts + 1.0)  # NaN stays NaN
@@ -1081,7 +1288,7 @@ class MissMap:
         Entrez db/context, options, AI model, and any failed cells. Counts on
         NCBI change daily, so an undated number is not citable.
         """
-        ai_model = self.llm.get("model") if isinstance(self.llm, dict) else None
+        ai_model = f"{self.llm.name}:{self.llm.model}" if self.llm is not None else None
         manifest = {
             "tool": "MissMap",
             "run_started": self.run_started,
@@ -1101,6 +1308,19 @@ class MissMap:
                 "non_interactive": self.non_interactive,
             },
             "ai_model": ai_model,
+            "ai_prompt_version": PROMPT_VERSION if self.llm is not None else None,
+            "ai_settings": getattr(self.llm, "settings", None),
+            "ai_calls": self._llm_records,
+            "expected_lineage_group": self.group,
+            "authorities": {cl.name: cl.version for cl in self.checklists},
+            "gbif_backbone_api": self.gbif is not None,
+            "ncbi_taxonomy_source": (self.taxdump.version if self.taxdump is not None
+                                     else "Entrez (live, run date)"),
+            "taxid_resolution": {sp: {"flags": i.get("flags", []), "candidates": i.get("candidates", [])}
+                                 for sp, i in self._taxon_info.items()},
+            "entrez_cache": ({"path": self.cache.path, "max_age_hours": self.cache.max_age,
+                              "hits": self.cache.hits, "misses": self.cache.misses}
+                             if self.cache is not None else None),
             "failed_cells": self._failed_cells,
             "note": "Counts reflect NCBI nuccore on the run date and change daily.",
         }
@@ -1109,6 +1329,49 @@ class MissMap:
             json.dump(manifest, f, indent=2)
         print(f"Saved run manifest to {path}")
         return path
+
+    def save_name_classification(self, ts):
+        """One row per (species, candidate name): bucket, NCBI TaxIDs, authority verdicts."""
+        if not self._name_rows:
+            return None
+        path = os.path.join(RESULTS_DIR, f"name_classification_{ts}.csv")
+        pd.DataFrame(self._name_rows).to_csv(path, index=False)
+        counts = pd.DataFrame(self._name_rows).groupby(["Source", "Bucket"]).size()
+        print("\n#==== Candidate names by source and bucket ====#\n")
+        print(counts.to_string())
+        print(f"\nSaved name classification to {path}")
+        return path
+
+    def save_comparisons(self, ts):
+        """
+        Aim 1 data: per-species cross-authority comparison (JSON) and a Darwin
+        Core crosswalk (CSV) with each authority's usage for every name.
+        """
+        if not self._comparisons:
+            return None
+        jpath = os.path.join(RESULTS_DIR, f"synonymy_comparison_{ts}.json")
+        with open(jpath, "w") as f:
+            json.dump(self._comparisons, f, indent=1)
+        rows = []
+        for cmp_ in self._comparisons:
+            sp = cmp_["species"]
+            names = [sp] + [r["name"] for r in cmp_["names"]]
+            for n in names:
+                ncbi_ids = self._taxonomy_name_search(n)
+                for cl in self.checklists:
+                    for u in cl.find(n):
+                        d = u.to_dwc()
+                        d.update({"querySpecies": sp, "ncbiTaxIDs": ",".join(ncbi_ids),
+                                  "matchMethod": "exact canonical name"})
+                        rows.append(d)
+                if not any(cl.find(n) for cl in self.checklists):
+                    rows.append({"querySpecies": sp, "scientificName": n, "source": "(none)",
+                                 "ncbiTaxIDs": ",".join(ncbi_ids), "matchMethod": "unmatched"})
+        cpath = os.path.join(RESULTS_DIR, f"crosswalk_dwc_{ts}.csv")
+        pd.DataFrame(rows).to_csv(cpath, index=False)
+        print(f"Saved synonymy comparison to {jpath}")
+        print(f"Saved Darwin Core crosswalk to {cpath}")
+        return jpath, cpath
 
     @staticmethod
     def _pick_excel_engine():
@@ -1148,9 +1411,15 @@ class MissMap:
 
     def display_and_save_matrix(self):
         df = pd.DataFrame(self.rows)
-        print("\n#==== GenBank data availability matrix ====#\n")
+        print("\n#==== GenBank data availability matrix (summary; full matrix in CSV/XLSX) ====#\n")
         if not df.empty:
-            print(df.to_string(index=False))
+            summary_cols = [c for c in (
+                ["Species", "TaxID", "TaxID Flags"] + list(self.dt_list) + [
+                    "Records w/ >=1 Selected Marker (deduplicated)", "Total NCBI (no filters)",
+                    "Hidden Records (all)", "Markers Gained via Synonyms",
+                    "Free-text Hits Not Under TaxID (over-count)", "Free-text Precision (%)",
+                    "Cells Failed (NA)"]) if c in df.columns]
+            print(df[summary_cols].to_string(index=False))
         else:
             print("[INFO] No rows to display.")
         print("\n#========================================#\n")
@@ -1167,6 +1436,10 @@ class MissMap:
         self._save_excel(df, ts)
         self.save_coverage_summary(ts)
         self.save_heatmap(ts)
+        if any(r.get("counts_reconciled", r["counts"]) != r["counts"] for r in self._matrix_records):
+            self.save_heatmap(ts, key="counts_reconciled", tag="_reconciled")
+        self.save_name_classification(ts)
+        self.save_comparisons(ts)
         self.save_manifest(ts)
 
 # ======================================================================
@@ -1183,6 +1456,26 @@ if __name__ == "__main__":
     config.load_config()
     config.terminal_inputs()
 
+    # authorities
+    checklists = []
+    if config.wcvp_path:
+        print(f"[INFO] Loading WCVP from {config.wcvp_path} ...")
+        checklists.append(load_wcvp(config.wcvp_path))
+    if config.wfo_path:
+        print(f"[INFO] Loading WFO from {config.wfo_path} ...")
+        checklists.append(load_wfo(config.wfo_path))
+    for name, path in config.dwc_paths.items():
+        print(f"[INFO] Loading {name} from {path} ...")
+        checklists.append(load_dwc(path, name))
+    for cl in checklists:
+        print(f"[INFO] {cl.name}: {len(cl):,} name usages loaded.")
+    if not checklists and not config.use_gbif:
+        print("[INFO] No authority checklists loaded (--wcvp/--wfo/--dwc/--gbif); hidden-record "
+              "and disagreement columns need at least one.")
+    taxdump = NcbiTaxdump(config.taxdump_dir) if config.taxdump_dir else None
+    cache = (EntrezCache(os.path.join(RESULTS_DIR, "entrez_cache.sqlite"), config.cache_hours)
+             if config.use_cache else None)
+
     # build program & init AI client
     program = MissMap(
         exclude_infraspecific=config.exclude_infraspecific,
@@ -1190,10 +1483,15 @@ if __name__ == "__main__":
         verbose=config.verbose,
         debug_queries=config.debug_queries,
         ai_validated_only=config.ai_validated_only,
-        non_interactive=config.non_interactive
+        non_interactive=config.non_interactive,
+        checklists=checklists,
+        gbif=GBIFBackbone() if config.use_gbif else None,
+        group=config.group,
+        taxdump=taxdump,
+        cache=cache,
     )
     if not config.no_ai:
-        program.init_ai_client(config.config_file)
+        program.init_ai_client(config.config_file, config.llm_spec)
     else:
         print("[INFO] AI synonym enrichment disabled (--no-ai).")
 
