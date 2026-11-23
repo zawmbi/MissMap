@@ -14,3 +14,13 @@ __pycache__/
 
 # local scratch scripts
 Joe'sTest.py
+
+# R session files
+.RData
+.Rhistory
+
+# local data downloads (versioned releases; record versions in the manifest instead)
+*.dmp
+wcvp*.csv
+wcvp*.zip
+classification.csv
